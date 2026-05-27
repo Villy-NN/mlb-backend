@@ -1,10 +1,11 @@
 import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+from pydantic import BaseModel
 from datetime import datetime
 
-app = FastAPI(title="MLB AI Analytics Backend")
+app = FastAPI(title="MLB VIP AI Analytics Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,8 +17,7 @@ app.add_middleware(
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 DB_HEADERS = {
     "apikey": SUPABASE_KEY or "",
@@ -26,9 +26,49 @@ DB_HEADERS = {
     "Prefer": "resolution=merge-duplicates"
 }
 
+# Модели для приема данных от тебя (Админка)
+class AdminInput(BaseModel):
+    ai_analysis: str  # Публичный прогноз Уткина из домашнего Gemini
+    preview_text: str  # Скрытая сырая статистика для VIP-чата (Ctrl+C с B-R)
+
+# Модель для приема сообщений от VIP-пользователя в чат
+class ChatMessageInput(BaseModel):
+    message: str
+
 @app.get("/")
 async def root():
-    return {"message": "Сервер MLB Analytics работает. Режим: Авто-статистика MLB и Кэширование ИИ."}
+    return {"message": "MLB VIP Server active. Gemini Search Grounding deployed."}
+
+# 1. ПОЛУЧЕНИЕ МАТЧЕЙ (Чистое расписание из MLB API, без букмекеров)
+@app.get("/fetch-schedule")
+async def fetch_schedule():
+    today = datetime.now().strftime('%Y-%m-%d')
+    mlb_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}"
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(mlb_url)
+        if response.status_code != 200:
+            return {"status": "error", "message": "Failed to fetch MLB schedule"}
+            
+        data = response.json()
+        games = data.get("dates", [{}])[0].get("games", [])
+        
+        matches_to_save = []
+        for game in games:
+            matches_to_save.append({
+                "id": str(game["gamePk"]),
+                "home_team": game["teams"]["home"]["team"]["name"],
+                "away_team": game["teams"]["away"]["team"]["name"],
+                "start_time": game["gameDate"],
+                "odds": {}, # Больше не используем API букмекеров
+                "chat_history": [] # Чистая история чата
+            })
+            
+        if matches_to_save:
+            supabase_url = f"{SUPABASE_URL}/rest/v1/matches"
+            await client.post(supabase_url, json=matches_to_save, headers=DB_HEADERS)
+            
+        return {"status": "success", "message": f"Loaded {len(matches_to_save)} games for today."}
 
 @app.get("/matches")
 async def get_matches():
@@ -39,159 +79,98 @@ async def get_matches():
             return response.json()
         return []
 
-@app.get("/fetch-odds")
-async def fetch_odds():
-    sport = 'baseball_mlb'
-    regions = 'us'
-    markets = 'h2h,totals,spreads' 
-    odds_format = 'decimal'
-    
-    odds_url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds/?apiKey={ODDS_API_KEY}&regions={regions}&markets={markets}&oddsFormat={odds_format}"
-
+# 2. АДМИНКА: Загрузка твоих ручных прогнозов и таблиц в базу
+@app.post("/matches/{match_id}/admin-update")
+async def admin_update(match_id: str, data: AdminInput):
     async with httpx.AsyncClient() as client:
-        try:
-            odds_response = await client.get(odds_url)
-            if odds_response.status_code != 200:
-                return {"error": "Не удалось получить коэффициенты", "details": odds_response.text}
-            
-            data = odds_response.json()
-            matches_to_save = []
-            
-            for match in data:
-                if not match.get("bookmakers"):
-                    continue
-                
-                bookmaker = match["bookmakers"][0]
-                match_odds = {}
-                for market in bookmaker["markets"]:
-                    match_odds[market["key"]] = market["outcomes"]
-                
-                match_info = {
-                    "id": match["id"],
-                    "home_team": match["home_team"],
-                    "away_team": match["away_team"],
-                    "start_time": match["commence_time"],
-                    "bookmaker": bookmaker["title"],
-                    "odds": match_odds
-                }
-                matches_to_save.append(match_info)
+        supabase_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+        payload = {
+            "ai_analysis": data.ai_analysis,
+            "preview_text": data.preview_text
+        }
+        response = await client.patch(supabase_url, json=payload, headers=DB_HEADERS)
+        if response.status_code in [200, 204]:
+            return {"status": "success", "message": "Match analysis and VIP database updated."}
+        return {"status": "error", "details": response.text}
 
-            supabase_rest_url = f"{SUPABASE_URL}/rest/v1/matches"
-            db_response = await client.post(supabase_rest_url, json=matches_to_save, headers=DB_HEADERS)
-            return {"status": "success", "message": f"Сохранено матчей: {len(matches_to_save)}"}
-        except Exception as e:
-            return {"error": "Ошибка", "details": str(e)}
-
-# ---> НОВАЯ ФУНКЦИЯ: ОФИЦИАЛЬНАЯ СТАТИСТИКА MLB <---
-@app.get("/sync-mlb-stats")
-async def sync_mlb_stats():
-    today = datetime.now().strftime('%Y-%m-%d')
-    mlb_schedule_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
-    
+# 3. СВЕРХУМНЫЙ VIP-ЧАТ С GOOGLE GEMINI + ИНТЕРНЕТ ПОИСК
+@app.post("/matches/{match_id}/chat")
+async def vip_chat(match_id: str, input_data: ChatMessageInput):
     async with httpx.AsyncClient() as client:
-        # 1. Получаем расписание из MLB
-        mlb_resp = await client.get(mlb_schedule_url)
-        if mlb_resp.status_code != 200:
-            return {"error": "Failed to fetch MLB API"}
-            
-        mlb_data = mlb_resp.json()
-        games = mlb_data.get("dates", [{}])[0].get("games", [])
-        
-        # 2. Получаем наши матчи из БД
-        db_resp = await client.get(f"{SUPABASE_URL}/rest/v1/matches?select=*", headers=DB_HEADERS)
-        db_matches = db_resp.json()
-        
-        updated_count = 0
-        
-        # 3. Сопоставляем данные
-        for db_match in db_matches:
-            for game in games:
-                home_team = game["teams"]["home"]["team"]["name"]
-                away_team = game["teams"]["away"]["team"]["name"]
-                
-                # Ищем совпадения по названию команд
-                if home_team in db_match["home_team"] or db_match["home_team"] in home_team:
-                    home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
-                    away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
-                    
-                    # Формируем ИДЕАЛЬНО ЧИСТЫЙ JSON для нейросети
-                    clean_stats = f"OFFICIAL PROBABLE PITCHERS:\nHome Pitcher: {home_pitcher}\nAway Pitcher: {away_pitcher}"
-                    
-                    # Сохраняем статистику в базу и сбрасываем старый кэш аналитики
-                    patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{db_match['id']}"
-                    await client.patch(patch_url, json={"preview_text": clean_stats, "ai_analysis": None}, headers=DB_HEADERS)
-                    updated_count += 1
-                    break
-
-        return {"status": "success", "message": f"Updated {updated_count} matches with MLB Pitchers."}
-
-@app.get("/analyze/{match_id}")
-async def analyze_match(match_id: str):
-    async with httpx.AsyncClient() as client:
-        # 1. Запрашиваем матч из БД
+        # Достаем матч, прогноз и скрытые таблицы из БД
         supabase_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}&select=*"
         db_response = await client.get(supabase_url, headers=DB_HEADERS)
         
         if db_response.status_code != 200 or not db_response.json():
-            return {"error": "Матч не найден в базе данных"}
+            raise HTTPException(status_code=404, detail="Match not found")
             
         match_data = db_response.json()[0]
         
-    # 2. ПРОВЕРКА КЭША (Чтобы ответы больше не прыгали)
-    if match_data.get("ai_analysis"):
-        return {
-            "status": "success",
-            "match": f"{match_data['home_team']} vs {match_data['away_team']}",
-            "ai_analysis": match_data["ai_analysis"] + "\n\n*(Loaded from cache)*"
-        }
-        
-    home = match_data["home_team"]
-    away = match_data["away_team"]
-    odds = match_data.get("odds", {})
-    preview_text = match_data.get("preview_text", "Starting pitchers TBD.")
-    
-    prompt = f"""
-    You are an elite, sharp MLB betting analyst in the literary style of Vasily Utkin (but speaking in American English). 
-    Your goal is to find mathematical value in the betting odds.
+    # Извлекаем контекст, который ты подготовил
+    public_forecast = match_data.get("ai_analysis", "No forecast published yet.")
+    raw_stats_tables = match_data.get("preview_text", "No detailed advanced stats uploaded yet.")
+    history = match_data.get("chat_history", [])
+    if not history: history = []
 
-    Matchup: {away} (Away) @ {home} (Home).
-    Current Odds: {odds}
-    Official Probable Pitchers: {preview_text}
+    # Конструируем системные инструкции (Промпт)
+    system_instruction = f"""
+    You are an elite live MLB betting expert in the sharp, cynical, and metaphorical literary style of Vasily Utkin, speaking in American English.
+    You are inside a premium, paid live chat room talking to a VIP client.
     
-    RULES:
-    1. Use correct baseball terminology.
-    2. Write exactly 4-6 sentences. 
-    3. Be witty, slightly snobbish, use metaphors.
-    4. Provide a clear final betting recommendation based on the synergy of the pitchers and the odds.
+    YOUR KNOWLEDGE BASE FOR THIS GAME:
+    1. Public Forecast you already wrote: {public_forecast}
+    2. Advanced Raw Stats Tables (from Baseball-Reference): {raw_stats_tables}
+    
+    YOUR CHALLENGE & ROLES:
+    - The user might give you live betting odds from their local sportsbook. Compare them against our Fair Line and tell them if it's a value bet or a scam.
+    - The user can argue with you, share their thoughts, or ask deep questions about pitchers, counts, or bullpen availability. Maintain a live, intellectual, slightly snobbish, but deeply analytical conversation.
+    - Use correct baseball terminology. Keep your responses engaging, under 4-5 sentences, unless a deep mathematical breakdown of odds is required.
+    - CRITICAL: You have access to Google Search. If the user asks about live game events, recent injuries (e.g., player incidents, sudden lineups changes), or weather updates, use your search tool to find real-time facts from the last 48 hours.
     """
+
+    # Собираем историю сообщений для формата Gemini API
+    contents = []
+    # Добавляем прошлую историю (если она есть)
+    for h in history:
+        contents.append({"role": h["role"], "parts": [{"text": h["text"]}]})
     
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as ai_client:
-            response = await ai_client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.15 # <--- ХОЛОДНАЯ МАТЕМАТИКА, НОЛЬ ГАЛЛЮЦИНАЦИЙ
-                }
-            )
-            
-            ai_data = response.json()
-            final_analysis = ai_data["choices"][0]["message"]["content"]
-            
-        # 3. СОХРАНЯЕМ В БАЗУ ДАННЫХ НАВСЕГДА
-        async with httpx.AsyncClient() as client:
-            patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
-            await client.patch(patch_url, json={"ai_analysis": final_analysis}, headers=DB_HEADERS)
-            
-        return {
-            "status": "success",
-            "match": f"{home} vs {away}",
-            "ai_analysis": final_analysis
+    # Добавляем текущее сообщение пользователя
+    contents.append({"role": "user", "parts": [{"text": input_data.message}]})
+
+    # Ссылка на официальный эндпоинт Google Gemini 1.5 Pro
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+    
+    # Конфигурация запроса с включенным ИНТЕРНЕТ ПОИСКОМ (Google Search Grounding)
+    gemini_payload = {
+        "contents": contents,
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "tools": [{"googleSearch": {}}], # <--- ВКЛЮЧИЛИ ЖИВОЙ ГУГЛ-ПОИСК СЕРВЕРА
+        "generationConfig": {
+            "temperature": 0.5
         }
-    except Exception as e:
-        return {"error": "Превышено время ожидания ИИ", "details": str(e)}
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as ai_client:
+        response = await ai_client.post(gemini_url, json=gemini_payload)
+        if response.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Gemini API Error: {response.text}")
+            
+        ai_data = response.json()
+        
+        try:
+            ai_response_text = ai_data["candidates"][0]["content"]["parts"][0]["text"]
+        except KeyError:
+            ai_response_text = "I am processing the data, but the stadium security is blocking my view. Let's look at the numbers again."
+
+    # Обновляем историю переписки в нашей базе данных
+    history.append({"role": "user", "text": input_data.message})
+    history.append({"role": "model", "text": ai_response_text})
+    
+    async with httpx.AsyncClient() as client:
+        patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+        await client.patch(patch_url, json={"chat_history": history}, headers=DB_HEADERS)
+
+    return {
+        "status": "success",
+        "reply": ai_response_text
+    }
