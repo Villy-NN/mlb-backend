@@ -138,7 +138,7 @@ async def vip_chat(match_id: str, input_data: ChatMessageInput):
     contents.append({"role": "user", "parts": [{"text": input_data.message}]})
 
     # Ссылка на официальный эндпоинт Google Gemini 1.5 Pro
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GEMINI_API_KEY}"
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     
     # Конфигурация запроса с включенным ИНТЕРНЕТ ПОИСКОМ (Google Search Grounding)
     gemini_payload = {
