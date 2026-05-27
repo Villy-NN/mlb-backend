@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = FastAPI(title="MLB VIP AI Analytics Backend")
 
@@ -22,8 +22,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_HEADERS = {
     "apikey": SUPABASE_KEY or "",
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates"
+    "Content-Type": "application/json"
 }
 
 class AdminInput(BaseModel):
@@ -37,10 +36,13 @@ class ChatMessageInput(BaseModel):
 async def root():
     return {"message": "MLB VIP Server active."}
 
-# 1. ЗАГРУЗКА РАСПИСАНИЯ И ПИТЧЕРОВ
+# 1. ЗАГРУЗКА РАСПИСАНИЯ И ПИТЧЕРОВ (С УЧЕТОМ ВРЕМЕНИ США)
 @app.get("/fetch-schedule")
 async def fetch_schedule():
-    today = datetime.now().strftime('%Y-%m-%d')
+    # Сдвигаем время сервера на Восточное время США (EST), чтобы не промазать мимо даты
+    us_time = datetime.utcnow() - timedelta(hours=5)
+    today = us_time.strftime('%Y-%m-%d')
+    
     mlb_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
     
     async with httpx.AsyncClient() as client:
@@ -49,39 +51,69 @@ async def fetch_schedule():
             return {"status": "error", "message": "Failed to fetch MLB schedule"}
             
         data = response.json()
-        games = data.get("dates", [{}])[0].get("games", [])
+        games = data.get("dates", [{}])
+        if not games:
+            return {"status": "success", "message": "No games scheduled for today."}
+            
+        games_list = games[0].get("games", [])
         
-        matches_to_save = []
-        for game in games:
+        for game in games_list:
+            match_id = str(game["gamePk"])
+            home_team = game["teams"]["home"]["team"]["name"]
+            away_team = game["teams"]["away"]["team"]["name"]
+            start_time = game["gameDate"]
+            
+            # Достаем питчеров
             home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
             away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
+            pitchers_text = f"⚾ {away_pitcher} vs {home_pitcher}"
             
-            matches_to_save.append({
-                "id": str(game["gamePk"]),
-                "home_team": game["teams"]["home"]["team"]["name"],
-                "away_team": game["teams"]["away"]["team"]["name"],
-                "start_time": game["gameDate"],
-                "pitchers": f"⚾ {away_pitcher} vs {home_pitcher}", # СОХРАНЯЕМ ПИТЧЕРОВ
-                "odds": {}, 
-                "chat_history": [] 
-            })
+            # Железобетонная логика сохранения: Проверяем, есть ли матч в БД
+            check_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+            check_res = await client.get(check_url, headers=DB_HEADERS)
             
-        if matches_to_save:
-            supabase_url = f"{SUPABASE_URL}/rest/v1/matches"
-            await client.post(supabase_url, json=matches_to_save, headers=DB_HEADERS)
-            
-        return {"status": "success", "message": f"Loaded {len(matches_to_save)} games for today."}
+            if check_res.status_code == 200 and len(check_res.json()) > 0:
+                # Если матч уже есть, насильно обновляем только питчеров
+                patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+                await client.patch(patch_url, json={"pitchers": pitchers_text}, headers=DB_HEADERS)
+            else:
+                # Если матча нет, создаем новый
+                new_match = {
+                    "id": match_id,
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "start_time": start_time,
+                    "pitchers": pitchers_text,
+                    "chat_history": []
+                }
+                post_url = f"{SUPABASE_URL}/rest/v1/matches"
+                await client.post(post_url, json=[new_match], headers=DB_HEADERS)
+                
+        return {"status": "success"}
 
-# 2. ФИЛЬТРАЦИЯ: ТОЛЬКО СЕГОДНЯШНИЕ МАТЧИ
+# 2. ЖЕСТКАЯ ФИЛЬТРАЦИЯ: УБИРАЕМ ВЧЕРАШНИЕ МАТЧИ
 @app.get("/matches")
 async def get_matches():
-    today = datetime.now().strftime('%Y-%m-%d')
+    us_time = datetime.utcnow() - timedelta(hours=5)
+    today_str = us_time.strftime('%Y-%m-%d')
+    
     async with httpx.AsyncClient() as client:
-        # Фильтр: отдавать матчи, где дата старта >= сегодня
-        supabase_url = f"{SUPABASE_URL}/rest/v1/matches?start_time=gte.{today}&order=start_time.asc&select=*"
+        supabase_url = f"{SUPABASE_URL}/rest/v1/matches?select=*"
         response = await client.get(supabase_url, headers=DB_HEADERS)
+        
         if response.status_code == 200:
-            return response.json()
+            all_matches = response.json()
+            today_matches = []
+            
+            # Фильтруем матчи железно через Python (оставляем только сегодняшние)
+            for m in all_matches:
+                if m.get("start_time", "").startswith(today_str):
+                    today_matches.append(m)
+                    
+            # Сортируем их по времени старта
+            today_matches.sort(key=lambda x: x.get("start_time", ""))
+            return today_matches
+            
         return []
 
 @app.post("/matches/{match_id}/admin-update")
@@ -95,7 +127,7 @@ async def admin_update(match_id: str, data: AdminInput):
         await client.patch(supabase_url, json=payload, headers=DB_HEADERS)
         return {"status": "success"}
 
-# 3. ЧАТ С НОВЫМ ИМЕНЕМ "BUDDY"
+# 3. VIP-ЧАТ: ИМЯ BUDDY, СТИЛЬ УТКИНА
 @app.post("/matches/{match_id}/chat")
 async def vip_chat(match_id: str, input_data: ChatMessageInput):
     async with httpx.AsyncClient() as client:
@@ -108,7 +140,6 @@ async def vip_chat(match_id: str, input_data: ChatMessageInput):
     history = match_data.get("chat_history", [])
     if not history: history = []
 
-    # ВОЗВРАЩАЕМ ЭЛИТНЫЙ ЛИТЕРАТУРНЫЙ СТИЛЬ С НОВЫМ ИМЕНЕМ
     system_instruction = f"""
     You are an elite live MLB betting expert and oddsmaker named 'Buddy'. 
     You speak and write EXCLUSIVELY in flawless American English.
