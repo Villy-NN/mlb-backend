@@ -39,7 +39,6 @@ async def root():
 # 1. ЗАГРУЗКА РАСПИСАНИЯ И ПИТЧЕРОВ (С УЧЕТОМ ВРЕМЕНИ США)
 @app.get("/fetch-schedule")
 async def fetch_schedule():
-    # Сдвигаем время сервера на Восточное время США (EST), чтобы не промазать мимо даты
     us_time = datetime.utcnow() - timedelta(hours=5)
     today = us_time.strftime('%Y-%m-%d')
     
@@ -63,21 +62,17 @@ async def fetch_schedule():
             away_team = game["teams"]["away"]["team"]["name"]
             start_time = game["gameDate"]
             
-            # Достаем питчеров
             home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
             away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
             pitchers_text = f"⚾ {away_pitcher} vs {home_pitcher}"
             
-            # Железобетонная логика сохранения: Проверяем, есть ли матч в БД
             check_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
             check_res = await client.get(check_url, headers=DB_HEADERS)
             
             if check_res.status_code == 200 and len(check_res.json()) > 0:
-                # Если матч уже есть, насильно обновляем только питчеров
                 patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
                 await client.patch(patch_url, json={"pitchers": pitchers_text}, headers=DB_HEADERS)
             else:
-                # Если матча нет, создаем новый
                 new_match = {
                     "id": match_id,
                     "home_team": home_team,
@@ -91,7 +86,7 @@ async def fetch_schedule():
                 
         return {"status": "success"}
 
-# 2. ЖЕСТКАЯ ФИЛЬТРАЦИЯ: УБИРАЕМ ВЧЕРАШНИЕ МАТЧИ
+# 2. ЖЕСТКАЯ ФИЛЬТРАЦИЯ: КОНВЕРТИРУЕМ ВРЕМЯ В США И УБИРАЕМ ВЧЕРАШНИЕ МАТЧИ
 @app.get("/matches")
 async def get_matches():
     us_time = datetime.utcnow() - timedelta(hours=5)
@@ -105,12 +100,21 @@ async def get_matches():
             all_matches = response.json()
             today_matches = []
             
-            # Фильтруем матчи железно через Python (оставляем только сегодняшние)
             for m in all_matches:
-                if m.get("start_time", "").startswith(today_str):
-                    today_matches.append(m)
+                st = m.get("start_time", "")
+                try:
+                    # Отрезаем лишнее, чтобы питон легко прочитал время
+                    clean_st = st.replace("T", " ")[:19]
+                    dt_utc = datetime.strptime(clean_st, '%Y-%m-%d %H:%M:%S')
+                    # Переводим время из Лондона в Нью-Йорк (-5 часов)
+                    dt_us = dt_utc - timedelta(hours=5)
                     
-            # Сортируем их по времени старта
+                    # Если американская дата матча совпадает с сегодняшней — берем!
+                    if dt_us.strftime('%Y-%m-%d') == today_str:
+                        today_matches.append(m)
+                except Exception as e:
+                    pass
+                    
             today_matches.sort(key=lambda x: x.get("start_time", ""))
             return today_matches
             
@@ -127,7 +131,7 @@ async def admin_update(match_id: str, data: AdminInput):
         await client.patch(supabase_url, json=payload, headers=DB_HEADERS)
         return {"status": "success"}
 
-# 3. VIP-ЧАТ: ИМЯ BUDDY, СТИЛЬ УТКИНА
+# 3. VIP-ЧАТ: УМ УТКИНА, ИМЯ BUDDY
 @app.post("/matches/{match_id}/chat")
 async def vip_chat(match_id: str, input_data: ChatMessageInput):
     async with httpx.AsyncClient() as client:
