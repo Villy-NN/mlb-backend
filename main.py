@@ -2,6 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+from pydantic import BaseModel # <--- ДОБАВИЛИ ДЛЯ ПРИЕМА ТЕКСТА
 
 app = FastAPI(title="MLB AI Analytics Backend")
 
@@ -13,13 +14,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# КЛЮЧИ БЕРУТСЯ ИЗ СЕЙФА НА RENDER:
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") # <--- НАШ НОВЫЙ ЗВЕЗДНЫЙ ИГРОК
-# ==========================================
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 DB_HEADERS = {
     "apikey": SUPABASE_KEY or "",
@@ -28,9 +26,13 @@ DB_HEADERS = {
     "Prefer": "resolution=merge-duplicates"
 }
 
+# Модель для приема текста превью
+class PreviewInput(BaseModel):
+    text: str
+
 @app.get("/")
 async def root():
-    return {"message": "Сервер MLB Analytics работает. Защита активна. Официальный Groq на поле!"}
+    return {"message": "Сервер MLB Analytics работает. Режим: Ручной ввод статистики."}
 
 @app.get("/matches")
 async def get_matches():
@@ -40,6 +42,17 @@ async def get_matches():
         if response.status_code == 200:
             return response.json()
         return []
+
+# ---> НОВЫЙ МЕТОД: ПРИНИМАЕТ ТЕКСТ ПРЕВЬЮ И СОХРАНЯЕТ В БАЗУ <---
+@app.post("/matches/{match_id}/preview")
+async def save_preview(match_id: str, data: PreviewInput):
+    async with httpx.AsyncClient() as client:
+        supabase_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+        # Обновляем колонку preview_text для конкретного матча
+        response = await client.patch(supabase_url, json={"preview_text": data.text}, headers=DB_HEADERS)
+        if response.status_code in [200, 204]:
+            return {"status": "success", "message": "Preview text saved successfully."}
+        return {"status": "error", "details": response.text}
 
 @app.get("/fetch-odds")
 async def fetch_odds():
@@ -102,6 +115,8 @@ async def analyze_match(match_id: str):
     home = match_data["home_team"]
     away = match_data["away_team"]
     odds = match_data.get("odds", {})
+    # Достаем наш сохраненный текст превью из базы
+    preview_text = match_data.get("preview_text", "No detailed statistics provided yet.")
     
     prompt = f"""
     Ты — глубочайший эксперт и аналитик Главной лиги бейсбола (MLB). Твоя задача — дать прогноз на матч для американской аудитории СТРОГО НА АМЕРИКАНСКОМ АНГЛИЙСКОМ ЯЗЫКЕ (American English).
@@ -111,18 +126,21 @@ async def analyze_match(match_id: str):
     ТВОЙ СТИЛЬ: Литературная и аналитическая манера легендарного комментатора Василия Уткина: 
     1. Невероятно остроумные, неожиданные метафоры.
     2. Легкий интеллектуальный снобизм и скрытая ирония.
-    3. Глубокое понимание логики игры, опирающееся на цифры.
+    3. Глубокое понимание логики игры, сочетающее сухие цифры статистики и букмекерские линии.
     
     Матч: {home} (хозяева) против {away} (гости).
     Коэффициенты букмекеров: {odds}
     
+    ДОПОЛНИТЕЛЬНАЯ БЕЙСБОЛЬНАЯ СТАТИСТИКА (с сайта Baseball-Reference):
+    {preview_text}
+    
     ЗАДАЧА:
-    Напиши монолог (4-6 предложений) на АНГЛИЙСКОМ ЯЗЫКЕ, объясняя, где здесь математическая ценность ставки (value bet). Заверши прогноз четкой рекомендацией ставки.
+    Внимательно изучи предоставленный текст статистики (найди там стартовых питчеров, их форму, ERA и другие важные маркеры) и букмекерские коэффициенты.
+    Напиши аналитический монолог (4-6 предложений) на АНГЛИЙСКОМ ЯЗЫКЕ, объясняя, где здесь математическая ценность ставки (value bet), основываясь на синергии статистики и коэффициентов. Заверши прогноз четкой рекомендацией ставки.
     """
     
     try:
-        # ОФИЦИАЛЬНЫЙ ВЫЗОВ К GROQ (Модель Llama 3.3 70B - одна из лучших в мире)
-        async with httpx.AsyncClient(timeout=15.0) as ai_client:
+        async with httpx.AsyncClient(timeout=20.0) as ai_client:
             response = await ai_client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={
