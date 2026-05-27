@@ -131,7 +131,7 @@ async def analyze_match(match_id: str):
                     "Accept": "application/json"
                 },
                 json={
-                    "model": "command-r",
+                    "model": "command-a-03-2025,
                     "message": prompt,
                     "temperature": 0.7
                 }
