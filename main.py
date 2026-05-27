@@ -14,11 +14,11 @@ app.add_middleware(
 )
 
 # ==========================================
-# КЛЮЧИ ТЕПЕРЬ БЕРУТСЯ ИЗ СЕЙФА НА RENDER:
+# КЛЮЧИ БЕРУТСЯ ИЗ СЕЙФА НА RENDER:
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # <--- НАШ НОВЫЙ ЗВЕЗДНЫЙ ИГРОК
 # ==========================================
 
 DB_HEADERS = {
@@ -30,7 +30,7 @@ DB_HEADERS = {
 
 @app.get("/")
 async def root():
-    return {"message": "Сервер MLB Analytics работает. Защита активна. ИИ на поле!"}
+    return {"message": "Сервер MLB Analytics работает. Защита активна. Официальный Groq на поле!"}
 
 @app.get("/matches")
 async def get_matches():
@@ -121,18 +121,17 @@ async def analyze_match(match_id: str):
     """
     
     try:
-        # Настоящий, боевой вызов мощной канадской нейросети Cohere (Модель Command-R)
+        # ОФИЦИАЛЬНЫЙ ВЫЗОВ К GROQ (Модель Llama 3.3 70B - одна из лучших в мире)
         async with httpx.AsyncClient(timeout=15.0) as ai_client:
             response = await ai_client.post(
-                "https://api.cohere.com/v1/chat",
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {COHERE_API_KEY}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
                 },
                 json={
-                    "model": "command-a-03-2025,
-                    "message": prompt,
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7
                 }
             )
@@ -145,7 +144,7 @@ async def analyze_match(match_id: str):
         return {
             "status": "success",
             "match": f"{home} vs {away}",
-            "ai_analysis": ai_data.get("text", "Ответ не получен")
+            "ai_analysis": ai_data["choices"][0]["message"]["content"]
         }
     except Exception as e:
         return {"error": "Превышено время ожидания ИИ", "details": str(e)}
