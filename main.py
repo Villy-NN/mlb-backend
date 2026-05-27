@@ -2,7 +2,7 @@ import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from pydantic import BaseModel # <--- ДОБАВИЛИ ДЛЯ ПРИЕМА ТЕКСТА
+from datetime import datetime
 
 app = FastAPI(title="MLB AI Analytics Backend")
 
@@ -26,13 +26,9 @@ DB_HEADERS = {
     "Prefer": "resolution=merge-duplicates"
 }
 
-# Модель для приема текста превью
-class PreviewInput(BaseModel):
-    text: str
-
 @app.get("/")
 async def root():
-    return {"message": "Сервер MLB Analytics работает. Режим: Ручной ввод статистики."}
+    return {"message": "Сервер MLB Analytics работает. Режим: Авто-статистика MLB и Кэширование ИИ."}
 
 @app.get("/matches")
 async def get_matches():
@@ -42,17 +38,6 @@ async def get_matches():
         if response.status_code == 200:
             return response.json()
         return []
-
-# ---> НОВЫЙ МЕТОД: ПРИНИМАЕТ ТЕКСТ ПРЕВЬЮ И СОХРАНЯЕТ В БАЗУ <---
-@app.post("/matches/{match_id}/preview")
-async def save_preview(match_id: str, data: PreviewInput):
-    async with httpx.AsyncClient() as client:
-        supabase_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
-        # Обновляем колонку preview_text для конкретного матча
-        response = await client.patch(supabase_url, json={"preview_text": data.text}, headers=DB_HEADERS)
-        if response.status_code in [200, 204]:
-            return {"status": "success", "message": "Preview text saved successfully."}
-        return {"status": "error", "details": response.text}
 
 @app.get("/fetch-odds")
 async def fetch_odds():
@@ -93,17 +78,57 @@ async def fetch_odds():
 
             supabase_rest_url = f"{SUPABASE_URL}/rest/v1/matches"
             db_response = await client.post(supabase_rest_url, json=matches_to_save, headers=DB_HEADERS)
-            
-            if db_response.status_code not in [200, 201]:
-                return {"error": "Ошибка БД", "details": db_response.text}
-
             return {"status": "success", "message": f"Сохранено матчей: {len(matches_to_save)}"}
         except Exception as e:
             return {"error": "Ошибка", "details": str(e)}
 
+# ---> НОВАЯ ФУНКЦИЯ: ОФИЦИАЛЬНАЯ СТАТИСТИКА MLB <---
+@app.get("/sync-mlb-stats")
+async def sync_mlb_stats():
+    today = datetime.now().strftime('%Y-%m-%d')
+    mlb_schedule_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
+    
+    async with httpx.AsyncClient() as client:
+        # 1. Получаем расписание из MLB
+        mlb_resp = await client.get(mlb_schedule_url)
+        if mlb_resp.status_code != 200:
+            return {"error": "Failed to fetch MLB API"}
+            
+        mlb_data = mlb_resp.json()
+        games = mlb_data.get("dates", [{}])[0].get("games", [])
+        
+        # 2. Получаем наши матчи из БД
+        db_resp = await client.get(f"{SUPABASE_URL}/rest/v1/matches?select=*", headers=DB_HEADERS)
+        db_matches = db_resp.json()
+        
+        updated_count = 0
+        
+        # 3. Сопоставляем данные
+        for db_match in db_matches:
+            for game in games:
+                home_team = game["teams"]["home"]["team"]["name"]
+                away_team = game["teams"]["away"]["team"]["name"]
+                
+                # Ищем совпадения по названию команд
+                if home_team in db_match["home_team"] or db_match["home_team"] in home_team:
+                    home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
+                    away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
+                    
+                    # Формируем ИДЕАЛЬНО ЧИСТЫЙ JSON для нейросети
+                    clean_stats = f"OFFICIAL PROBABLE PITCHERS:\nHome Pitcher: {home_pitcher}\nAway Pitcher: {away_pitcher}"
+                    
+                    # Сохраняем статистику в базу и сбрасываем старый кэш аналитики
+                    patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{db_match['id']}"
+                    await client.patch(patch_url, json={"preview_text": clean_stats, "ai_analysis": None}, headers=DB_HEADERS)
+                    updated_count += 1
+                    break
+
+        return {"status": "success", "message": f"Updated {updated_count} matches with MLB Pitchers."}
+
 @app.get("/analyze/{match_id}")
 async def analyze_match(match_id: str):
     async with httpx.AsyncClient() as client:
+        # 1. Запрашиваем матч из БД
         supabase_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}&select=*"
         db_response = await client.get(supabase_url, headers=DB_HEADERS)
         
@@ -112,31 +137,32 @@ async def analyze_match(match_id: str):
             
         match_data = db_response.json()[0]
         
+    # 2. ПРОВЕРКА КЭША (Чтобы ответы больше не прыгали)
+    if match_data.get("ai_analysis"):
+        return {
+            "status": "success",
+            "match": f"{match_data['home_team']} vs {match_data['away_team']}",
+            "ai_analysis": match_data["ai_analysis"] + "\n\n*(Loaded from cache)*"
+        }
+        
     home = match_data["home_team"]
     away = match_data["away_team"]
     odds = match_data.get("odds", {})
-    # Достаем наш сохраненный текст превью из базы
-    preview_text = match_data.get("preview_text", "No detailed statistics provided yet.")
+    preview_text = match_data.get("preview_text", "Starting pitchers TBD.")
     
     prompt = f"""
-    Ты — глубочайший эксперт и аналитик Главной лиги бейсбола (MLB). Твоя задача — дать прогноз на матч для американской аудитории СТРОГО НА АМЕРИКАНСКОМ АНГЛИЙСКОМ ЯЗЫКЕ (American English).
+    You are an elite, sharp MLB betting analyst in the literary style of Vasily Utkin (but speaking in American English). 
+    Your goal is to find mathematical value in the betting odds.
 
-    КРИТИЧЕСКИ ВАЖНО: Используй ТОЛЬКО правильную бейсбольную терминологию (питчеры, иннинги, страйкауты, базы). Никаких баскетбольных терминов или футбольных словечек!
-
-    ТВОЙ СТИЛЬ: Литературная и аналитическая манера легендарного комментатора Василия Уткина: 
-    1. Невероятно остроумные, неожиданные метафоры.
-    2. Легкий интеллектуальный снобизм и скрытая ирония.
-    3. Глубокое понимание логики игры, сочетающее сухие цифры статистики и букмекерские линии.
+    Matchup: {away} (Away) @ {home} (Home).
+    Current Odds: {odds}
+    Official Probable Pitchers: {preview_text}
     
-    Матч: {home} (хозяева) против {away} (гости).
-    Коэффициенты букмекеров: {odds}
-    
-    ДОПОЛНИТЕЛЬНАЯ БЕЙСБОЛЬНАЯ СТАТИСТИКА (с сайта Baseball-Reference):
-    {preview_text}
-    
-    ЗАДАЧА:
-    Внимательно изучи предоставленный текст статистики (найди там стартовых питчеров, их форму, ERA и другие важные маркеры) и букмекерские коэффициенты.
-    Напиши аналитический монолог (4-6 предложений) на АНГЛИЙСКОМ ЯЗЫКЕ, объясняя, где здесь математическая ценность ставки (value bet), основываясь на синергии статистики и коэффициентов. Заверши прогноз четкой рекомендацией ставки.
+    RULES:
+    1. Use correct baseball terminology.
+    2. Write exactly 4-6 sentences. 
+    3. Be witty, slightly snobbish, use metaphors.
+    4. Provide a clear final betting recommendation based on the synergy of the pitchers and the odds.
     """
     
     try:
@@ -150,19 +176,22 @@ async def analyze_match(match_id: str):
                 json={
                     "model": "llama-3.3-70b-versatile",
                     "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.7
+                    "temperature": 0.15 # <--- ХОЛОДНАЯ МАТЕМАТИКА, НОЛЬ ГАЛЛЮЦИНАЦИЙ
                 }
             )
             
-            if response.status_code != 200:
-                return {"error": f"Ошибка на сервере ИИ: {response.status_code}", "details": response.text}
-                
             ai_data = response.json()
+            final_analysis = ai_data["choices"][0]["message"]["content"]
+            
+        # 3. СОХРАНЯЕМ В БАЗУ ДАННЫХ НАВСЕГДА
+        async with httpx.AsyncClient() as client:
+            patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+            await client.patch(patch_url, json={"ai_analysis": final_analysis}, headers=DB_HEADERS)
             
         return {
             "status": "success",
             "match": f"{home} vs {away}",
-            "ai_analysis": ai_data["choices"][0]["message"]["content"]
+            "ai_analysis": final_analysis
         }
     except Exception as e:
         return {"error": "Превышено время ожидания ИИ", "details": str(e)}
