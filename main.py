@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -13,14 +14,15 @@ app.add_middleware(
 )
 
 # ==========================================
-# ВСТАВЬ СВОИ 3 КЛЮЧА СЮДА:
-SUPABASE_URL = "https://fnuzgypznyzcphewmjdl.supabase.co"
-SUPABASE_KEY = "sb_publishable_QihCry4fW9xq7S9cGJWCDg_TmUk46wP"
-ODDS_API_KEY = "eKRVdBsw+wpqfp5"
+# КЛЮЧИ ТЕПЕРЬ БЕРУТСЯ ИЗ СЕЙФА НА RENDER:
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 # ==========================================
 
 DB_HEADERS = {
-    "apikey": SUPABASE_KEY,
+    "apikey": SUPABASE_KEY or "",
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates"
@@ -28,9 +30,8 @@ DB_HEADERS = {
 
 @app.get("/")
 async def root():
-    return {"message": "Сервер MLB Analytics работает. Режим: Подготовка фронтенда."}
+    return {"message": "Сервер MLB Analytics работает. Защита активна. ИИ на поле!"}
 
-# ---> НОВАЯ ФУНКЦИЯ ДЛЯ ФРОНТЕНДА (ОТДАЕТ СПИСОК МАТЧЕЙ) <---
 @app.get("/matches")
 async def get_matches():
     async with httpx.AsyncClient() as client:
@@ -100,17 +101,51 @@ async def analyze_match(match_id: str):
         
     home = match_data["home_team"]
     away = match_data["away_team"]
+    odds = match_data.get("odds", {})
     
-    mock_ai_text = f"""
-    Alright, listen up, baseball junkies. We are currently looking at the matchup between the {home} and the {away}. 
+    prompt = f"""
+    Ты — глубочайший эксперт и аналитик Главной лиги бейсбола (MLB). Твоя задача — дать прогноз на матч для американской аудитории СТРОГО НА АМЕРИКАНСКОМ АНГЛИЙСКОМ ЯЗЫКЕ (American English).
+
+    КРИТИЧЕСКИ ВАЖНО: Используй ТОЛЬКО правильную бейсбольную терминологию (питчеры, иннинги, страйкауты, базы). Никаких баскетбольных терминов или футбольных словечек!
+
+    ТВОЙ СТИЛЬ: Литературная и аналитическая манера легендарного комментатора Василия Уткина: 
+    1. Невероятно остроумные, неожиданные метафоры.
+    2. Легкий интеллектуальный снобизм и скрытая ирония.
+    3. Глубокое понимание логики игры, опирающееся на цифры.
     
-    This is a placeholder text to test our mobile application interface. When we deploy this to the production server in the US, this space will be filled with a brilliant breakdown of the pitching matchups, the bullpen ERA, and where the mathematical value lies in the odds. 
+    Матч: {home} (хозяева) против {away} (гости).
+    Коэффициенты букмекеров: {odds}
     
-    For now, just make sure this text looks beautiful, readable, and perfectly aligned on your smartphone screen!
+    ЗАДАЧА:
+    Напиши монолог (4-6 предложений) на АНГЛИЙСКОМ ЯЗЫКЕ, объясняя, где здесь математическая ценность ставки (value bet). Заверши прогноз четкой рекомендацией ставки.
     """
     
-    return {
-        "status": "success",
-        "match": f"{home} vs {away}",
-        "ai_analysis": mock_ai_text.strip()
-    }
+    try:
+        # Настоящий, боевой вызов мощной канадской нейросети Cohere (Модель Command-R)
+        async with httpx.AsyncClient(timeout=15.0) as ai_client:
+            response = await ai_client.post(
+                "https://api.cohere.com/v1/chat",
+                headers={
+                    "Authorization": f"Bearer {COHERE_API_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                json={
+                    "model": "command-r",
+                    "message": prompt,
+                    "temperature": 0.7
+                }
+            )
+            
+            if response.status_code != 200:
+                return {"error": f"Ошибка на сервере ИИ: {response.status_code}", "details": response.text}
+                
+            ai_data = response.json()
+            
+        return {
+            "status": "success",
+            "match": f"{home} vs {away}",
+            "ai_analysis": ai_data.get("text", "Ответ не получен")
+        }
+    except Exception as e:
+        return {"error": "Превышено время ожидания ИИ", "details": str(e)}
