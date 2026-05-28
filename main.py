@@ -36,15 +36,15 @@ class ChatMessageInput(BaseModel):
 async def root():
     return {"message": "BaseBet VIP Server active."}
 
-# 1. ЗАГРУЗКА РАСПИСАНИЯ, СЧЕТА И СТАТИСТИКИ (СЕГОДНЯ + ВЧЕРА)
+# 1. ЗАГРУЗКА РАСПИСАНИЯ, СЧЕТА И СТАТИСТИКИ 
 @app.get("/fetch-schedule")
 async def fetch_schedule():
     us_time = datetime.utcnow() - timedelta(hours=5)
     today_str = us_time.strftime('%Y-%m-%d')
     yesterday_str = (us_time - timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # Скачиваем 2 дня сразу, чтобы знать результаты прошлых игр
-    mlb_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate={yesterday_str}&endDate={today_str}&hydrate=probablePitcher"
+    # Запрашиваем 2 дня и гидратируем стату питчеров (stats)
+    mlb_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate={yesterday_str}&endDate={today_str}&hydrate=probablePitcher(stats)"
     
     async with httpx.AsyncClient() as client:
         response = await client.get(mlb_url)
@@ -62,16 +62,33 @@ async def fetch_schedule():
                 away_team = game["teams"]["away"]["team"]["name"]
                 start_time = game["gameDate"]
                 
-                # Достаем Питчеров и Статистику (Победы-Поражения)
-                home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
-                away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
-                
+                # --- КОМАНДНАЯ СТАТИСТИКА (W-L) ---
                 home_w = game["teams"]["home"].get("leagueRecord", {}).get("wins", "0")
                 home_l = game["teams"]["home"].get("leagueRecord", {}).get("losses", "0")
                 away_w = game["teams"]["away"].get("leagueRecord", {}).get("wins", "0")
                 away_l = game["teams"]["away"].get("leagueRecord", {}).get("losses", "0")
                 
-                pitchers_text = f"⚾ {away_pitcher} ({away_w}-{away_l}) vs {home_pitcher} ({home_w}-{home_l})"
+                away_record = f"{away_w}-{away_l}"
+                home_record = f"{home_w}-{home_l}"
+                
+                # --- ЛИЧНАЯ СТАТИСТИКА ПИТЧЕРОВ (W-L, ERA) ---
+                def get_pitcher_str(team_side):
+                    p_obj = game["teams"][team_side].get("probablePitcher", {})
+                    p_name = p_obj.get("fullName", "TBD")
+                    if p_name == "TBD": return "TBD"
+                    try:
+                        # MLB API прячет стату глубоко
+                        stats = p_obj.get("stats", [{}])[0].get("splits", [{}])[0].get("stat", {})
+                        w = stats.get("wins", "?")
+                        l = stats.get("losses", "?")
+                        era = stats.get("era", "-.--")
+                        return f"{p_name} ({w}-{l}, {era} ERA)"
+                    except:
+                        return p_name # Если статы нет, возвращаем просто имя
+                
+                away_pitcher_str = get_pitcher_str("away")
+                home_pitcher_str = get_pitcher_str("home")
+                pitchers_text = f"⚾ {away_pitcher_str} vs {home_pitcher_str}"
                 
                 # Достаем Статус и Счет
                 status = game.get("status", {}).get("detailedState", "Scheduled")
@@ -85,15 +102,15 @@ async def fetch_schedule():
                 payload = {
                     "pitchers": pitchers_text,
                     "status": status,
-                    "score": score_text
+                    "score": score_text,
+                    "away_record": away_record,
+                    "home_record": home_record
                 }
                 
                 if check_res.status_code == 200 and len(check_res.json()) > 0:
-                    # Обновляем счет и статус у существующего матча
                     patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
                     await client.patch(patch_url, json=payload, headers=DB_HEADERS)
                 else:
-                    # Создаем новый матч
                     new_match = {
                         "id": match_id,
                         "home_team": home_team,
@@ -107,7 +124,7 @@ async def fetch_schedule():
                 
         return {"status": "success"}
 
-# 2. ВЫДАЧА МАТЧЕЙ (УМНАЯ ЛОГИКА ДНЕЙ)
+# 2. ВЫДАЧА МАТЧЕЙ (ВЧЕРА + СЕГОДНЯ)
 @app.get("/matches")
 async def get_matches():
     us_time = datetime.utcnow() - timedelta(hours=5)
@@ -140,11 +157,8 @@ async def get_matches():
             today_matches.sort(key=lambda x: x.get("start_time", ""))
             yesterday_matches.sort(key=lambda x: x.get("start_time", ""))
             
-            # Если сегодня игр нет (или они еще не загружены), отдаем результаты вчерашних!
-            if not today_matches and yesterday_matches:
-                return yesterday_matches
-                
-            return today_matches
+            # Возвращаем ВСЕ матчи: сначала вчерашние (результаты), потом сегодняшние!
+            return yesterday_matches + today_matches
             
         return []
 
