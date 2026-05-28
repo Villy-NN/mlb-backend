@@ -5,7 +5,7 @@ import httpx
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 
-app = FastAPI(title="MLB VIP AI Analytics Backend")
+app = FastAPI(title="BaseBet VIP AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,15 +34,17 @@ class ChatMessageInput(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "MLB VIP Server active."}
+    return {"message": "BaseBet VIP Server active."}
 
-# 1. ЗАГРУЗКА РАСПИСАНИЯ И ПИТЧЕРОВ (С УЧЕТОМ ВРЕМЕНИ США)
+# 1. ЗАГРУЗКА РАСПИСАНИЯ, СЧЕТА И СТАТИСТИКИ (СЕГОДНЯ + ВЧЕРА)
 @app.get("/fetch-schedule")
 async def fetch_schedule():
     us_time = datetime.utcnow() - timedelta(hours=5)
-    today = us_time.strftime('%Y-%m-%d')
+    today_str = us_time.strftime('%Y-%m-%d')
+    yesterday_str = (us_time - timedelta(days=1)).strftime('%Y-%m-%d')
     
-    mlb_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={today}&hydrate=probablePitcher"
+    # Скачиваем 2 дня сразу, чтобы знать результаты прошлых игр
+    mlb_url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate={yesterday_str}&endDate={today_str}&hydrate=probablePitcher"
     
     async with httpx.AsyncClient() as client:
         response = await client.get(mlb_url)
@@ -50,47 +52,67 @@ async def fetch_schedule():
             return {"status": "error", "message": "Failed to fetch MLB schedule"}
             
         data = response.json()
-        games = data.get("dates", [{}])
-        if not games:
-            return {"status": "success", "message": "No games scheduled for today."}
-            
-        games_list = games[0].get("games", [])
+        dates = data.get("dates", [])
         
-        for game in games_list:
-            match_id = str(game["gamePk"])
-            home_team = game["teams"]["home"]["team"]["name"]
-            away_team = game["teams"]["away"]["team"]["name"]
-            start_time = game["gameDate"]
-            
-            home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
-            away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
-            pitchers_text = f"⚾ {away_pitcher} vs {home_pitcher}"
-            
-            check_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
-            check_res = await client.get(check_url, headers=DB_HEADERS)
-            
-            if check_res.status_code == 200 and len(check_res.json()) > 0:
-                patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
-                await client.patch(patch_url, json={"pitchers": pitchers_text}, headers=DB_HEADERS)
-            else:
-                new_match = {
-                    "id": match_id,
-                    "home_team": home_team,
-                    "away_team": away_team,
-                    "start_time": start_time,
+        for date_obj in dates:
+            games_list = date_obj.get("games", [])
+            for game in games_list:
+                match_id = str(game["gamePk"])
+                home_team = game["teams"]["home"]["team"]["name"]
+                away_team = game["teams"]["away"]["team"]["name"]
+                start_time = game["gameDate"]
+                
+                # Достаем Питчеров и Статистику (Победы-Поражения)
+                home_pitcher = game["teams"]["home"].get("probablePitcher", {}).get("fullName", "TBD")
+                away_pitcher = game["teams"]["away"].get("probablePitcher", {}).get("fullName", "TBD")
+                
+                home_w = game["teams"]["home"].get("leagueRecord", {}).get("wins", "0")
+                home_l = game["teams"]["home"].get("leagueRecord", {}).get("losses", "0")
+                away_w = game["teams"]["away"].get("leagueRecord", {}).get("wins", "0")
+                away_l = game["teams"]["away"].get("leagueRecord", {}).get("losses", "0")
+                
+                pitchers_text = f"⚾ {away_pitcher} ({away_w}-{away_l}) vs {home_pitcher} ({home_w}-{home_l})"
+                
+                # Достаем Статус и Счет
+                status = game.get("status", {}).get("detailedState", "Scheduled")
+                away_score = game["teams"]["away"].get("score", "")
+                home_score = game["teams"]["home"].get("score", "")
+                score_text = f"{away_score} - {home_score}" if str(away_score).isdigit() else ""
+                
+                check_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+                check_res = await client.get(check_url, headers=DB_HEADERS)
+                
+                payload = {
                     "pitchers": pitchers_text,
-                    "chat_history": []
+                    "status": status,
+                    "score": score_text
                 }
-                post_url = f"{SUPABASE_URL}/rest/v1/matches"
-                await client.post(post_url, json=[new_match], headers=DB_HEADERS)
+                
+                if check_res.status_code == 200 and len(check_res.json()) > 0:
+                    # Обновляем счет и статус у существующего матча
+                    patch_url = f"{SUPABASE_URL}/rest/v1/matches?id=eq.{match_id}"
+                    await client.patch(patch_url, json=payload, headers=DB_HEADERS)
+                else:
+                    # Создаем новый матч
+                    new_match = {
+                        "id": match_id,
+                        "home_team": home_team,
+                        "away_team": away_team,
+                        "start_time": start_time,
+                        "chat_history": [],
+                        **payload
+                    }
+                    post_url = f"{SUPABASE_URL}/rest/v1/matches"
+                    await client.post(post_url, json=[new_match], headers=DB_HEADERS)
                 
         return {"status": "success"}
 
-# 2. ЖЕСТКАЯ ФИЛЬТРАЦИЯ: КОНВЕРТИРУЕМ ВРЕМЯ В США И УБИРАЕМ ВЧЕРАШНИЕ МАТЧИ
+# 2. ВЫДАЧА МАТЧЕЙ (УМНАЯ ЛОГИКА ДНЕЙ)
 @app.get("/matches")
 async def get_matches():
     us_time = datetime.utcnow() - timedelta(hours=5)
     today_str = us_time.strftime('%Y-%m-%d')
+    yesterday_str = (us_time - timedelta(days=1)).strftime('%Y-%m-%d')
     
     async with httpx.AsyncClient() as client:
         supabase_url = f"{SUPABASE_URL}/rest/v1/matches?select=*"
@@ -99,23 +121,29 @@ async def get_matches():
         if response.status_code == 200:
             all_matches = response.json()
             today_matches = []
+            yesterday_matches = []
             
             for m in all_matches:
-                st = m.get("start_time", "")
+                st = m.get("start_time", "").replace("T", " ")[:19]
                 try:
-                    # Отрезаем лишнее, чтобы питон легко прочитал время
-                    clean_st = st.replace("T", " ")[:19]
-                    dt_utc = datetime.strptime(clean_st, '%Y-%m-%d %H:%M:%S')
-                    # Переводим время из Лондона в Нью-Йорк (-5 часов)
+                    dt_utc = datetime.strptime(st, '%Y-%m-%d %H:%M:%S')
                     dt_us = dt_utc - timedelta(hours=5)
+                    match_date = dt_us.strftime('%Y-%m-%d')
                     
-                    # Если американская дата матча совпадает с сегодняшней — берем!
-                    if dt_us.strftime('%Y-%m-%d') == today_str:
+                    if match_date == today_str:
                         today_matches.append(m)
-                except Exception as e:
+                    elif match_date == yesterday_str:
+                        yesterday_matches.append(m)
+                except:
                     pass
                     
             today_matches.sort(key=lambda x: x.get("start_time", ""))
+            yesterday_matches.sort(key=lambda x: x.get("start_time", ""))
+            
+            # Если сегодня игр нет (или они еще не загружены), отдаем результаты вчерашних!
+            if not today_matches and yesterday_matches:
+                return yesterday_matches
+                
             return today_matches
             
         return []
@@ -131,7 +159,6 @@ async def admin_update(match_id: str, data: AdminInput):
         await client.patch(supabase_url, json=payload, headers=DB_HEADERS)
         return {"status": "success"}
 
-# 3. VIP-ЧАТ: УМ УТКИНА, ИМЯ BUDDY
 @app.post("/matches/{match_id}/chat")
 async def vip_chat(match_id: str, input_data: ChatMessageInput):
     async with httpx.AsyncClient() as client:
