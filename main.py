@@ -3,8 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
+import google.generativeai as genai
+
+# === ПОДКЛЮЧЕНИЕ ТОГО САМОГО GEMINI 2.5 FLASH ===
+GEMINI_API_KEY = "AIzaSyAvI1ScQuVBqksPv78G08hbOI3HQ5tRaIE" 
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-2.5-flash')
+# ================================================
 
 app = FastAPI(title="MLB Buddy AI Server")
 
@@ -17,7 +24,7 @@ app.add_middleware(
 )
 
 matches_db: Dict[str, dict] = {}
-LAST_FETCH_TIME = 0  # Время последнего автоматического скачивания данных
+LAST_FETCH_TIME = 0  
 
 class ChatMessage(BaseModel):
     message: str
@@ -29,7 +36,6 @@ class AdminUpdate(BaseModel):
 
 
 def get_mlb_linescore(game_pk: int) -> Optional[dict]:
-    """Скачивает живые иннинги и статистику из официального API MLB"""
     try:
         url = f"https://statsapi.mlb.com/api/v1/game/{game_pk}/linescore"
         res = requests.get(url, timeout=5).json()
@@ -40,7 +46,6 @@ def get_mlb_linescore(game_pk: int) -> Optional[dict]:
         for inning in res.get("innings", []):
             away_runs = inning.get("away", {}).get("runs")
             home_runs = inning.get("home", {}).get("runs")
-            
             away_innings.append(str(away_runs) if away_runs is not None else "-")
             
             if home_runs is None:
@@ -65,77 +70,78 @@ def get_mlb_linescore(game_pk: int) -> Optional[dict]:
             "h": str(teams.get("home", {}).get("hits", "-")),
             "e": str(teams.get("home", {}).get("errors", "-"))
         }
-        
-        return {
-            "away_innings": away_innings,
-            "home_innings": home_innings,
-            "away_totals": away_totals,
-            "home_totals": home_totals
-        }
+        return {"away_innings": away_innings, "home_innings": home_innings, "away_totals": away_totals, "home_totals": home_totals}
     except Exception as e:
-        print(f"Error fetching linescore for game {game_pk}: {e}")
         return None
 
 
 def sync_mlb_data():
-    """Скачивает матчи за ВЧЕРА, СЕГОДНЯ и ЗАВТРА, чтобы результаты не слетали"""
+    """Скачивает строго ТОЛЬКО СЕГОДНЯШНИЕ матчи, очищая старые из памяти"""
     global LAST_FETCH_TIME
     try:
-        # Формируем окно в 3 дня
-        yesterday_str = (datetime.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-        tomorrow_str = (datetime.today() + timedelta(days=1)).strftime('%Y-%m-%d')
-        
-        url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&startDate={yesterday_str}&endDate={tomorrow_str}"
+        today_str = datetime.today().strftime('%Y-%m-%d')
+        url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={today_str}"
         response = requests.get(url, timeout=5).json()
         
         dates = response.get("dates", [])
-        for date_obj in dates:
-            games = date_obj.get("games", [])
-            for game in games:
-                game_id = str(game.get("gamePk"))
-                status_info = game.get("status", {})
-                abstract_status = status_info.get("abstractGameState", "Preview")
-                detailed_status = status_info.get("detailedState", "")
-                
-                teams = game.get("teams", {})
-                away_team = teams.get("away", {}).get("team", {}).get("name", "Away Team")
-                home_team = teams.get("home", {}).get("team", {}).get("name", "Home Team")
-                
-                away_record = f"{teams.get('away', {}).get('leagueRecord', {}).get('wins', 0)}-{teams.get('away', {}).get('leagueRecord', {}).get('losses', 0)}"
-                home_record = f"{teams.get('home', {}).get('leagueRecord', {}).get('wins', 0)}-{teams.get('home', {}).get('leagueRecord', {}).get('losses', 0)}"
-                
-                if abstract_status != "Preview":
-                    away_score = teams.get("away", {}).get("score", 0)
-                    home_score = teams.get("home", {}).get("score", 0)
-                    score_str = f"{away_score} - {home_score}"
-                else:
-                    score_str = "@"
-                
-                away_pitcher = game.get("teams", {}).get("away", {}).get("probablePitcher", {}).get("name", "")
-                home_pitcher = game.get("teams", {}).get("home", {}).get("probablePitcher", {}).get("name", "")
-                pitchers_str = f"{away_pitcher} vs {home_pitcher}" if away_pitcher or home_pitcher else ""
-                
-                linescore_data = get_mlb_linescore(game.get("gamePk")) if abstract_status != "Preview" else None
-                existing_game = matches_db.get(game_id, {})
-                
-                matches_db[game_id] = {
-                    "id": game_id,
-                    "away_team": away_team,
-                    "home_team": home_team,
-                    "away_record": away_record,
-                    "home_record": home_record,
-                    "status": detailed_status if detailed_status else abstract_status,
-                    "score": score_str,
-                    "pitchers": pitchers_str,
-                    "manual_pitchers": existing_game.get("manual_pitchers", ""),
-                    "ai_analysis": existing_game.get("ai_analysis", ""),
-                    "preview_text": existing_game.get("preview_text", ""),
-                    "is_published": existing_game.get("is_published", False),
-                    "chat_history": existing_game.get("chat_history", []),
-                    "linescore": linescore_data
-                }
+        if not dates:
+            matches_db.clear() # Если сегодня игр нет, очищаем базу
+            return 0
+            
+        games = dates[0].get("games", [])
+        
+        # --- ФИЛЬТР ОТ ДУБЛИКАТОВ И СТАРЫХ МАТЧЕЙ ---
+        today_game_ids = set([str(g.get("gamePk")) for g in games])
+        keys_to_remove = [k for k in matches_db.keys() if k not in today_game_ids]
+        for k in keys_to_remove:
+            del matches_db[k]
+        # --------------------------------------------
+            
+        for game in games:
+            game_id = str(game.get("gamePk"))
+            status_info = game.get("status", {})
+            abstract_status = status_info.get("abstractGameState", "Preview")
+            detailed_status = status_info.get("detailedState", "")
+            
+            teams = game.get("teams", {})
+            away_team = teams.get("away", {}).get("team", {}).get("name", "Away Team")
+            home_team = teams.get("home", {}).get("team", {}).get("name", "Home Team")
+            
+            away_record = f"{teams.get('away', {}).get('leagueRecord', {}).get('wins', 0)}-{teams.get('away', {}).get('leagueRecord', {}).get('losses', 0)}"
+            home_record = f"{teams.get('home', {}).get('leagueRecord', {}).get('wins', 0)}-{teams.get('home', {}).get('leagueRecord', {}).get('losses', 0)}"
+            
+            if abstract_status != "Preview":
+                away_score = teams.get("away", {}).get("score", 0)
+                home_score = teams.get("home", {}).get("score", 0)
+                score_str = f"{away_score} - {home_score}"
+            else:
+                score_str = "@"
+            
+            away_pitcher = game.get("teams", {}).get("away", {}).get("probablePitcher", {}).get("name", "")
+            home_pitcher = game.get("teams", {}).get("home", {}).get("probablePitcher", {}).get("name", "")
+            pitchers_str = f"{away_pitcher} vs {home_pitcher}" if away_pitcher or home_pitcher else ""
+            
+            linescore_data = get_mlb_linescore(game.get("gamePk")) if abstract_status != "Preview" else None
+            existing_game = matches_db.get(game_id, {})
+            
+            matches_db[game_id] = {
+                "id": game_id,
+                "away_team": away_team,
+                "home_team": home_team,
+                "away_record": away_record,
+                "home_record": home_record,
+                "status": detailed_status if detailed_status else abstract_status,
+                "score": score_str,
+                "pitchers": pitchers_str,
+                "manual_pitchers": existing_game.get("manual_pitchers", ""),
+                "ai_analysis": existing_game.get("ai_analysis", ""),
+                "preview_text": existing_game.get("preview_text", ""),
+                "is_published": existing_game.get("is_published", False),
+                "chat_history": existing_game.get("chat_history", []),
+                "linescore": linescore_data
+            }
         LAST_FETCH_TIME = time.time()
-        return len(dates)
+        return len(games)
     except Exception as e:
         print(f"Error in sync_mlb_data: {e}")
         return 0
@@ -143,21 +149,17 @@ def sync_mlb_data():
 
 @app.get("/fetch-schedule")
 def fetch_schedule():
-    """Ручная команда загрузки базы из админки"""
-    games_count = sync_mlb_data()
-    return {"status": "success", "message": "Database synchronized successfully."}
+    sync_mlb_data()
+    return {"status": "success", "message": "Database synchronized with today's games."}
 
 
 @app.get("/matches")
 def get_matches(boss: int = 0):
-    """Возвращает список матчей и автоматически обновляет их раз в 60 секунд"""
     global LAST_FETCH_TIME
-    # Умный авто-апдейт: если прошло больше 60 секунд — бэкенд сам качает свежий счет из MLB
     if time.time() - LAST_FETCH_TIME > 60:
         sync_mlb_data()
         
     matches_list = list(matches_db.values())
-    # Сортируем матчи по ID, чтобы они не прыгали местами на экране
     matches_list.sort(key=lambda x: x.get("id", ""))
     
     if boss == 1:
@@ -199,7 +201,6 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
     match = matches_db[match_id]
     user_msg = data.message
     
-    from main import generate_buddy_reply
     ai_reply = generate_buddy_reply(match, user_msg)
     
     if "chat_history" not in match:
@@ -210,14 +211,33 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
 
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
-    msg_lower = user_msg.lower()
+    """Генерация ответа через Google Gemini 2.5 Flash в стиле Василия Уткина"""
     away = match['away_team']
     home = match['home_team']
     pitchers = match['manual_pitchers'] if match['manual_pitchers'] else match['pitchers']
-    if any(word in msg_lower for word in ["who", "win", "pick", "кто", "побед"]):
-        return f"Analyzing the pitching matchup ({pitchers or 'TBA'}), my system detects a clear quantitative edge. Bullpen analytics lean toward the value side. See my complete pick details in the unlocked block above!"
-    else:
-        return f"Interesting angle on the {away} vs {home} game! Based on starter rotation ({pitchers or 'TBA'}), our mathematical model points to standard variance. Let me know if you need specific player projections!"
+    ai_analysis = match.get('ai_analysis', 'Прогноз еще формируется.')
+    
+    prompt = f"""Ты — Buddy AI, премиальный спортивный аналитик и ИИ-ассистент по бейсболу (MLB).
+Твой стиль общения — это легендарный спортивный комментатор Василий Уткин, но адаптированный под американский бейсбол.
+Используй хлесткие, парадоксальные метафоры. Общайся с тонкой иронией, литературно, богато. Ты уверен в себе, слегка снисходителен к букмекерам и толпе, но с глубоким уважением относишься к VIP-клиенту, который с тобой советуется.
+Не используй приветствия вроде "Приветствую" или "Здравствуйте", начинай сразу мощно, как будто ворвался в эфир.
+Если клиент спрашивает на английском - отвечай на английском (сохраняя сарказм и стиль). Если на русском - на русском.
+
+Контекст текущего матча:
+Матч: {away} против {home}
+Стартовые питчеры: {pitchers}
+Текущий счет/статус: {match['score']}
+Официальный аналитический прогноз на игру: {ai_analysis}
+
+Вопрос VIP-клиента: {user_msg}
+
+Ответь в своем фирменном стиле Василия Уткина, дай конкретику по вопросу клиента, используя контекст матча. Держи ответ в пределах 3-5 предложений, не пиши эссе."""
+
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Господа, на поле выбежал голый болельщик, трансляция прервана! (Ошибка связи с ядром ИИ: {e})"
 
 if __name__ == "__main__":
     import uvicorn
