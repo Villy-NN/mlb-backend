@@ -1,17 +1,23 @@
+import os
+import requests
+from datetime import datetime
+import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
-import requests
-from datetime import datetime
-import time
 import google.generativeai as genai
 
-# === ПОДКЛЮЧЕНИЕ ТОГО САМОГО GEMINI 2.5 FLASH ===
-GEMINI_API_KEY = "AIzaSyAvI1ScQuVBqksPv78G08hbOI3HQ5tRaIE" 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.5-flash')
-# ================================================
+# === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.5-flash')
+else:
+    print("CRITICAL WARNING: GEMINI_API_KEY environment variable is missing!")
+    model = None
+# =========================================================
 
 app = FastAPI(title="MLB Buddy AI Server")
 
@@ -132,7 +138,7 @@ def sync_mlb_data():
                 "pitchers": pitchers_str,
                 "manual_pitchers": existing_game.get("manual_pitchers", ""),
                 "ai_analysis": existing_game.get("ai_analysis", ""),
-                "preview_text": existing_game.get("preview_text", ""), # ТА САМАЯ СКРЫТАЯ СТАТИСТИКА
+                "preview_text": existing_game.get("preview_text", ""), 
                 "is_published": existing_game.get("is_published", False),
                 "chat_history": existing_game.get("chat_history", []),
                 "linescore": linescore_data
@@ -208,12 +214,13 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
 
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
-    """Жесткая, математическая логика Buddy AI. Ищет Валуй на основе статистики."""
+    """Жесткая, математическая логика Buddy AI. Проверяет Валуй."""
+    if not model:
+        return "System error. Gemini API Key is missing on the server variables."
+        
     away = match['away_team']
     home = match['home_team']
     pitchers = match['manual_pitchers'] if match['manual_pitchers'] else match['pitchers']
-    
-    # Это поле B-R Raw Tables из админки (скрытые цифры для мозга ИИ)
     raw_stats = match.get('preview_text', 'No advanced stats provided by admin yet.')
     
     prompt = f"""You are Buddy AI, a highly advanced, sharp MLB sports betting quant and handicapper. 
