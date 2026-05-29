@@ -8,14 +8,16 @@ from pydantic import BaseModel
 from typing import Optional, Dict
 import google.generativeai as genai
 
-# === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
+# === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧИ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
 else:
-    print("CRITICAL WARNING: GEMINI_API_KEY environment variable is missing!")
+    print("CRITICAL WARNING: GEMINI_API_KEY variable is missing!")
     model = None
 # =========================================================
 
@@ -39,6 +41,15 @@ class AdminUpdate(BaseModel):
     ai_analysis: Optional[str] = None
     preview_text: Optional[str] = None
     manual_pitchers: Optional[str] = None
+
+
+@app.get("/config")
+def get_config():
+    """Безопасный эндпоинт для передачи конфигурации Supabase на фронтенд"""
+    return {
+        "supabase_url": SUPABASE_URL if SUPABASE_URL else "",
+        "supabase_anon_key": SUPABASE_ANON_KEY if SUPABASE_ANON_KEY else ""
+    }
 
 
 def get_mlb_linescore(game_pk: int) -> Optional[dict]:
@@ -73,7 +84,7 @@ def get_mlb_linescore(game_pk: int) -> Optional[dict]:
         }
         home_totals = {
             "r": str(teams.get("home", {}).get("runs", "-")),
-            "h": str(teams.get("home", {}).get("hits", "-")),
+            "h": str(teams.get("home", {}).get("runs", "-")),
             "e": str(teams.get("home", {}).get("errors", "-"))
         }
         return {"away_innings": away_innings, "home_innings": home_innings, "away_totals": away_totals, "home_totals": home_totals}
@@ -214,7 +225,6 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
 
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
-    """Жесткая, математическая логика Buddy AI. Проверяет Валуй."""
     if not model:
         return "System error. Gemini API Key is missing on the server variables."
         
