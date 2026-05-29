@@ -76,7 +76,6 @@ def get_mlb_linescore(game_pk: int) -> Optional[dict]:
 
 
 def sync_mlb_data():
-    """Скачивает строго ТОЛЬКО СЕГОДНЯШНИЕ матчи, очищая старые из памяти"""
     global LAST_FETCH_TIME
     try:
         today_str = datetime.today().strftime('%Y-%m-%d')
@@ -85,17 +84,15 @@ def sync_mlb_data():
         
         dates = response.get("dates", [])
         if not dates:
-            matches_db.clear() # Если сегодня игр нет, очищаем базу
+            matches_db.clear() 
             return 0
             
         games = dates[0].get("games", [])
         
-        # --- ФИЛЬТР ОТ ДУБЛИКАТОВ И СТАРЫХ МАТЧЕЙ ---
         today_game_ids = set([str(g.get("gamePk")) for g in games])
         keys_to_remove = [k for k in matches_db.keys() if k not in today_game_ids]
         for k in keys_to_remove:
             del matches_db[k]
-        # --------------------------------------------
             
         for game in games:
             game_id = str(game.get("gamePk"))
@@ -135,7 +132,7 @@ def sync_mlb_data():
                 "pitchers": pitchers_str,
                 "manual_pitchers": existing_game.get("manual_pitchers", ""),
                 "ai_analysis": existing_game.get("ai_analysis", ""),
-                "preview_text": existing_game.get("preview_text", ""),
+                "preview_text": existing_game.get("preview_text", ""), # ТА САМАЯ СКРЫТАЯ СТАТИСТИКА
                 "is_published": existing_game.get("is_published", False),
                 "chat_history": existing_game.get("chat_history", []),
                 "linescore": linescore_data
@@ -211,33 +208,40 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
 
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
-    """Генерация ответа через Google Gemini 2.5 Flash в стиле Василия Уткина"""
+    """Жесткая, математическая логика Buddy AI. Ищет Валуй на основе статистики."""
     away = match['away_team']
     home = match['home_team']
     pitchers = match['manual_pitchers'] if match['manual_pitchers'] else match['pitchers']
-    ai_analysis = match.get('ai_analysis', 'Прогноз еще формируется.')
     
-    prompt = f"""Ты — Buddy AI, премиальный спортивный аналитик и ИИ-ассистент по бейсболу (MLB).
-Твой стиль общения — это легендарный спортивный комментатор Василий Уткин, но адаптированный под американский бейсбол.
-Используй хлесткие, парадоксальные метафоры. Общайся с тонкой иронией, литературно, богато. Ты уверен в себе, слегка снисходителен к букмекерам и толпе, но с глубоким уважением относишься к VIP-клиенту, который с тобой советуется.
-Не используй приветствия вроде "Приветствую" или "Здравствуйте", начинай сразу мощно, как будто ворвался в эфир.
-Если клиент спрашивает на английском - отвечай на английском (сохраняя сарказм и стиль). Если на русском - на русском.
+    # Это поле B-R Raw Tables из админки (скрытые цифры для мозга ИИ)
+    raw_stats = match.get('preview_text', 'No advanced stats provided by admin yet.')
+    
+    prompt = f"""You are Buddy AI, a highly advanced, sharp MLB sports betting quant and handicapper. 
+Your audience is American sports bettors looking for an edge against Vegas sportsbooks.
+Your tone is direct, analytical, professional, and slightly cynical about public betting squares. 
+NO flowery metaphors. NO poetic language. NO bullshit. Speak strictly in numbers, probabilities, expected value (+EV), and betting odds.
 
-Контекст текущего матча:
-Матч: {away} против {home}
-Стартовые питчеры: {pitchers}
-Текущий счет/статус: {match['score']}
-Официальный аналитический прогноз на игру: {ai_analysis}
+Your goal: Evaluate if the user's bet has VALUE. 
+- If the user provides odds (e.g., "Padres at -130"), evaluate if it's a good bet based on the provided stats.
+- If the user DOES NOT provide odds (e.g., "San Diego win?"), explicitly tell them to provide the sportsbook odds/lines so you can calculate the expected value (+EV). Explain that you don't guess winners, you play the numbers.
+- Argue and debate using the "Raw Advanced Stats" provided below.
 
-Вопрос VIP-клиента: {user_msg}
+Match Context:
+Game: {away} @ {home}
+Starting Pitchers: {pitchers}
+Current Score/Status: {match['score']}
+Raw Advanced Stats (Use these to argue your point): {raw_stats}
 
-Ответь в своем фирменном стиле Василия Уткина, дай конкретику по вопросу клиента, используя контекст матча. Держи ответ в пределах 3-5 предложений, не пиши эссе."""
+User Input: {user_msg}
+
+Respond concisely (3-5 sentences). Be sharp and helpful. If the user asks in Russian, answer in Russian (but keep the American sharp bettor vibe). If they ask in English, answer in English."""
 
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Господа, на поле выбежал голый болельщик, трансляция прервана! (Ошибка связи с ядром ИИ: {e})"
+        return f"System error. Connection to Vegas servers lost. (Error: {e})"
+
 
 if __name__ == "__main__":
     import uvicorn
