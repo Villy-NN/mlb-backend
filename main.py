@@ -7,18 +7,27 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 import google.generativeai as genai
+from supabase import create_client, Client
 
 # === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧИ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
+# Инициализация Gemini 2.5 Flash
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
 else:
     print("CRITICAL WARNING: GEMINI_API_KEY variable is missing!")
     model = None
+
+# Инициализация клиента Supabase
+if SUPABASE_URL and SUPABASE_ANON_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+else:
+    print("CRITICAL WARNING: Supabase environment variables are missing!")
+    supabase = None
 # =========================================================
 
 app = FastAPI(title="MLB Buddy AI Server")
@@ -45,11 +54,34 @@ class AdminUpdate(BaseModel):
 
 @app.get("/config")
 def get_config():
-    """Безопасный эндпоинт для передачи конфигурации Supabase на фронтенд"""
+    """Передаем конфигурацию Supabase на фронтенд динамически"""
     return {
         "supabase_url": SUPABASE_URL if SUPABASE_URL else "",
         "supabase_anon_key": SUPABASE_ANON_KEY if SUPABASE_ANON_KEY else ""
     }
+
+
+def load_matches_from_supabase():
+    """Загружает все сохраненные прогнозы и чаты из Supabase в память сервера"""
+    global matches_db
+    if not supabase: return
+    try:
+        response = supabase.table("matches").select("id, data").execute()
+        for row in response.data:
+            game_id = row["id"]
+            matches_db[game_id] = row["data"]
+        print(f"Loaded {len(response.data)} matches from Supabase permanent storage.")
+    except Exception as e:
+        print(f"Error loading from Supabase: {e}")
+
+
+def save_match_to_supabase(game_id: str, match_data: dict):
+    """Надежно сохраняет или обновляет матч в Supabase (Upsert)"""
+    if not supabase: return
+    try:
+        supabase.table("matches").upsert({"id": game_id, "data": match_data}).execute()
+    except Exception as e:
+        print(f"Error saving to Supabase: {e}")
 
 
 def get_mlb_linescore(game_pk: int) -> Optional[dict]:
@@ -95,22 +127,19 @@ def get_mlb_linescore(game_pk: int) -> Optional[dict]:
 def sync_mlb_data():
     global LAST_FETCH_TIME
     try:
+        # Первым делом подтягиваем из Supabase старые прогнозы, чтобы не затереть их!
+        load_matches_from_supabase()
+        
         today_str = datetime.today().strftime('%Y-%m-%d')
         url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={today_str}"
         response = requests.get(url, timeout=5).json()
         
         dates = response.get("dates", [])
         if not dates:
-            matches_db.clear() 
             return 0
             
         games = dates[0].get("games", [])
         
-        today_game_ids = set([str(g.get("gamePk")) for g in games])
-        keys_to_remove = [k for k in matches_db.keys() if k not in today_game_ids]
-        for k in keys_to_remove:
-            del matches_db[k]
-            
         for game in games:
             game_id = str(game.get("gamePk"))
             status_info = game.get("status", {})
@@ -138,7 +167,8 @@ def sync_mlb_data():
             linescore_data = get_mlb_linescore(game.get("gamePk")) if abstract_status != "Preview" else None
             existing_game = matches_db.get(game_id, {})
             
-            matches_db[game_id] = {
+            # Собираем обновленный объект матча
+            match_object = {
                 "id": game_id,
                 "away_team": away_team,
                 "home_team": home_team,
@@ -154,6 +184,11 @@ def sync_mlb_data():
                 "chat_history": existing_game.get("chat_history", []),
                 "linescore": linescore_data
             }
+            
+            matches_db[game_id] = match_object
+            # Сохраняем в Supabase permanent storage
+            save_match_to_supabase(game_id, match_object)
+            
         LAST_FETCH_TIME = time.time()
         return len(games)
     except Exception as e:
@@ -172,6 +207,9 @@ def get_matches(boss: int = 0):
     global LAST_FETCH_TIME
     if time.time() - LAST_FETCH_TIME > 60:
         sync_mlb_data()
+    else:
+        # Если 60 секунд еще не прошло, всё равно подгружаем актуальное из Supabase
+        load_matches_from_supabase()
         
     matches_list = list(matches_db.values())
     matches_list.sort(key=lambda x: x.get("id", ""))
@@ -190,28 +228,33 @@ def get_matches(boss: int = 0):
 
 @app.post("/publish-board")
 def publish_board():
+    load_matches_from_supabase()
     for game_id in matches_db:
         matches_db[game_id]["is_published"] = True
+        save_match_to_supabase(game_id, matches_db[game_id])
     return {"status": "success", "message": "The premium board is now LIVE."}
 
 
 @app.post("/matches/{match_id}/admin-update")
 def admin_update(match_id: str, data: AdminUpdate):
+    load_matches_from_supabase()
     if match_id not in matches_db:
         raise HTTPException(status_code=404, detail="Match not found")
-    if data.ai_analysis is not None:
-        matches_db[match_id]["ai_analysis"] = data.ai_analysis
-    if data.preview_text is not None:
-        matches_db[match_id]["preview_text"] = data.preview_text
-    if data.manual_pitchers is not None:
-        matches_db[match_id]["manual_pitchers"] = data.manual_pitchers
-    return {"status": "success", "message": "Saved."}
+        
+    if data.ai_analysis is not None: matches_db[match_id]["ai_analysis"] = data.ai_analysis
+    if data.preview_text is not None: matches_db[match_id]["preview_text"] = data.preview_text
+    if data.manual_pitchers is not None: matches_db[match_id]["manual_pitchers"] = data.manual_pitchers
+    
+    save_match_to_supabase(match_id, matches_db[match_id])
+    return {"status": "success", "message": "Saved to Supabase Permanent Storage."}
 
 
 @app.post("/matches/{match_id}/chat")
 def chat_with_buddy(match_id: str, data: ChatMessage):
+    load_matches_from_supabase()
     if match_id not in matches_db:
         raise HTTPException(status_code=404, detail="Match not found")
+        
     match = matches_db[match_id]
     user_msg = data.message
     
@@ -221,13 +264,13 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
         match["chat_history"] = []
     match["chat_history"].append({"role": "user", "text": user_msg})
     match["chat_history"].append({"role": "assistant", "text": ai_reply})
+    
+    save_match_to_supabase(match_id, match)
     return {"reply": ai_reply}
 
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
-    if not model:
-        return "System error. Gemini API Key is missing on the server variables."
-        
+    if not model: return "System error. Gemini API Key is missing."
     away = match['away_team']
     home = match['home_team']
     pitchers = match['manual_pitchers'] if match['manual_pitchers'] else match['pitchers']
