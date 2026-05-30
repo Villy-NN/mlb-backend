@@ -184,8 +184,9 @@ def sync_mlb_data():
                 "ai_analysis": existing_game.get("ai_analysis", ""),
                 "preview_text": existing_game.get("preview_text", ""), 
                 "is_published": existing_game.get("is_published", False),
-                "chat_history": existing_chat, # ТЕПЕРЬ ЭТО СЛОВАРЬ {"user_email": [сообщения]}
-                "linescore": linescore_data
+                "chat_history": existing_chat, 
+                "linescore": linescore_data,
+                "game_datetime": game.get("gameDate") # ДОСТАЕМ ТОЧНОЕ ВРЕМЯ МАТЧА ИЗ MLB API
             }
             
             matches_db[game_id] = match_object
