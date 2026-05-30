@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
-# Инициализация Gemini 2.5 Flash
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-2.5-flash')
@@ -22,7 +21,6 @@ else:
     print("CRITICAL WARNING: GEMINI_API_KEY variable is missing!")
     model = None
 
-# Инициализация клиента Supabase
 if SUPABASE_URL and SUPABASE_ANON_KEY:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 else:
@@ -43,26 +41,24 @@ app.add_middleware(
 matches_db: Dict[str, dict] = {}
 LAST_FETCH_TIME = 0  
 
+# ДОБАВЛЕН USER_ID ДЛЯ ПРИВАТНОСТИ
 class ChatMessage(BaseModel):
     message: str
+    user_id: str 
 
 class AdminUpdate(BaseModel):
     ai_analysis: Optional[str] = None
     preview_text: Optional[str] = None
     manual_pitchers: Optional[str] = None
 
-
 @app.get("/config")
 def get_config():
-    """Передаем конфигурацию Supabase на фронтенд динамически"""
     return {
         "supabase_url": SUPABASE_URL if SUPABASE_URL else "",
         "supabase_anon_key": SUPABASE_ANON_KEY if SUPABASE_ANON_KEY else ""
     }
 
-
 def load_matches_from_supabase():
-    """Загружает все сохраненные прогнозы и чаты из Supabase в память сервера"""
     global matches_db
     if not supabase: return
     try:
@@ -70,19 +66,15 @@ def load_matches_from_supabase():
         for row in response.data:
             game_id = row["id"]
             matches_db[game_id] = row["data"]
-        print(f"Loaded {len(response.data)} matches from Supabase permanent storage.")
     except Exception as e:
         print(f"Error loading from Supabase: {e}")
 
-
 def save_match_to_supabase(game_id: str, match_data: dict):
-    """Надежно сохраняет или обновляет матч в Supabase (Upsert)"""
     if not supabase: return
     try:
         supabase.table("matches").upsert({"id": game_id, "data": match_data}).execute()
     except Exception as e:
         print(f"Error saving to Supabase: {e}")
-
 
 def get_mlb_linescore(game_pk: int) -> Optional[dict]:
     try:
@@ -116,22 +108,21 @@ def get_mlb_linescore(game_pk: int) -> Optional[dict]:
         }
         home_totals = {
             "r": str(teams.get("home", {}).get("runs", "-")),
-            "h": str(teams.get("home", {}).get("runs", "-")),
+            "h": str(teams.get("home", {}).get("hits", "-")),
             "e": str(teams.get("home", {}).get("errors", "-"))
         }
         return {"away_innings": away_innings, "home_innings": home_innings, "away_totals": away_totals, "home_totals": home_totals}
     except Exception as e:
         return None
 
-
 def sync_mlb_data():
     global LAST_FETCH_TIME
     try:
-        # Первым делом подтягиваем из Supabase старые прогнозы, чтобы не затереть их!
         load_matches_from_supabase()
         
-        today_str = datetime.today().strftime('%Y-%m-%d')
-        url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={today_str}"
+        # РЕШЕНИЕ ПРОБЛЕМЫ 1: СМЕЩАЕМ ВРЕМЯ НА АМЕРИКАНСКОЕ (-8 часов от Лондона)
+        us_date = (datetime.utcnow() - timedelta(hours=8)).strftime('%Y-%m-%d')
+        url = f"https://statsapi.mlb.com/api/v1/schedule/games/?sportId=1&date={us_date}"
         response = requests.get(url, timeout=5).json()
         
         dates = response.get("dates", [])
@@ -140,6 +131,15 @@ def sync_mlb_data():
             
         games = dates[0].get("games", [])
         
+        # ЖЕСТКАЯ ОЧИСТКА: Удаляем вчерашние игры из памяти и базы
+        active_ids = {str(g.get("gamePk")) for g in games}
+        keys_to_remove = [k for k in list(matches_db.keys()) if k not in active_ids]
+        for k in keys_to_remove:
+            del matches_db[k]
+            if supabase:
+                try: supabase.table("matches").delete().eq("id", k).execute()
+                except: pass
+            
         for game in games:
             game_id = str(game.get("gamePk"))
             status_info = game.get("status", {})
@@ -167,7 +167,10 @@ def sync_mlb_data():
             linescore_data = get_mlb_linescore(game.get("gamePk")) if abstract_status != "Preview" else None
             existing_game = matches_db.get(game_id, {})
             
-            # Собираем обновленный объект матча
+            # АДАПТАЦИЯ ИСТОРИИ ЧАТА В СЛОВАРЬ
+            existing_chat = existing_game.get("chat_history", {})
+            if isinstance(existing_chat, list): existing_chat = {}
+            
             match_object = {
                 "id": game_id,
                 "away_team": away_team,
@@ -181,12 +184,11 @@ def sync_mlb_data():
                 "ai_analysis": existing_game.get("ai_analysis", ""),
                 "preview_text": existing_game.get("preview_text", ""), 
                 "is_published": existing_game.get("is_published", False),
-                "chat_history": existing_game.get("chat_history", []),
+                "chat_history": existing_chat, # ТЕПЕРЬ ЭТО СЛОВАРЬ {"user_email": [сообщения]}
                 "linescore": linescore_data
             }
             
             matches_db[game_id] = match_object
-            # Сохраняем в Supabase permanent storage
             save_match_to_supabase(game_id, match_object)
             
         LAST_FETCH_TIME = time.time()
@@ -195,12 +197,10 @@ def sync_mlb_data():
         print(f"Error in sync_mlb_data: {e}")
         return 0
 
-
 @app.get("/fetch-schedule")
 def fetch_schedule():
     sync_mlb_data()
     return {"status": "success", "message": "Database synchronized with today's games."}
-
 
 @app.get("/matches")
 def get_matches(boss: int = 0):
@@ -208,23 +208,28 @@ def get_matches(boss: int = 0):
     if time.time() - LAST_FETCH_TIME > 60:
         sync_mlb_data()
     else:
-        # Если 60 секунд еще не прошло, всё равно подгружаем актуальное из Supabase
         load_matches_from_supabase()
         
     matches_list = list(matches_db.values())
     matches_list.sort(key=lambda x: x.get("id", ""))
     
-    if boss == 1:
-        return matches_list
-    else:
-        public_matches = []
-        for m in matches_list:
-            m_copy = m.copy()
-            if not m_copy.get("is_published"):
-                m_copy["ai_analysis"] = ""
-            public_matches.append(m_copy)
-        return public_matches
+    public_matches = []
+    for m in matches_list:
+        m_copy = m.copy()
+        # РЕШЕНИЕ ПРОБЛЕМЫ 2: ВЫРЕЗАЕМ ИСТОРИЮ ЧАТА ИЗ ОБЩЕГО ДОСТУПА
+        m_copy["chat_history"] = {} 
+        if boss != 1 and not m_copy.get("is_published"):
+            m_copy["ai_analysis"] = ""
+        public_matches.append(m_copy)
+    return public_matches
 
+# НОВЫЙ ЭНДПОИНТ: Выдает чат только для конкретного юзера
+@app.get("/matches/{match_id}/chat/{user_id}")
+def get_user_chat(match_id: str, user_id: str):
+    if match_id not in matches_db: return []
+    chat_dict = matches_db[match_id].get("chat_history", {})
+    if isinstance(chat_dict, list): return []
+    return chat_dict.get(user_id, [])
 
 @app.post("/publish-board")
 def publish_board():
@@ -233,7 +238,6 @@ def publish_board():
         matches_db[game_id]["is_published"] = True
         save_match_to_supabase(game_id, matches_db[game_id])
     return {"status": "success", "message": "The premium board is now LIVE."}
-
 
 @app.post("/matches/{match_id}/admin-update")
 def admin_update(match_id: str, data: AdminUpdate):
@@ -248,7 +252,6 @@ def admin_update(match_id: str, data: AdminUpdate):
     save_match_to_supabase(match_id, matches_db[match_id])
     return {"status": "success", "message": "Saved to Supabase Permanent Storage."}
 
-
 @app.post("/matches/{match_id}/chat")
 def chat_with_buddy(match_id: str, data: ChatMessage):
     load_matches_from_supabase()
@@ -257,17 +260,21 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
         
     match = matches_db[match_id]
     user_msg = data.message
+    user_id = data.user_id # Привязываем к email юзера
     
     ai_reply = generate_buddy_reply(match, user_msg)
     
-    if "chat_history" not in match:
-        match["chat_history"] = []
-    match["chat_history"].append({"role": "user", "text": user_msg})
-    match["chat_history"].append({"role": "assistant", "text": ai_reply})
+    if "chat_history" not in match or isinstance(match["chat_history"], list):
+        match["chat_history"] = {}
+        
+    if user_id not in match["chat_history"]:
+        match["chat_history"][user_id] = []
+        
+    match["chat_history"][user_id].append({"role": "user", "text": user_msg})
+    match["chat_history"][user_id].append({"role": "assistant", "text": ai_reply})
     
     save_match_to_supabase(match_id, match)
     return {"reply": ai_reply}
-
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
     if not model: return "System error. Gemini API Key is missing."
@@ -301,7 +308,6 @@ Respond concisely (3-5 sentences). Be sharp and helpful. If the user asks in Rus
         return response.text
     except Exception as e:
         return f"System error. Connection to Vegas servers lost. (Error: {e})"
-
 
 if __name__ == "__main__":
     import uvicorn
