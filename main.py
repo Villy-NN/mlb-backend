@@ -283,7 +283,10 @@ def generate_buddy_reply(match: dict, user_msg: str) -> str:
     away = match['away_team']
     home = match['home_team']
     pitchers = match['manual_pitchers'] if match['manual_pitchers'] else match['pitchers']
-    raw_stats = match.get('preview_text', 'No advanced stats provided by admin yet.')
+    
+    # Теперь он видит И сырые таблицы из Экселя, И твой официальный прогноз
+    raw_stats = match.get('preview_text', 'No raw stats provided.')
+    official_forecast = match.get('ai_analysis', 'No official forecast published yet.')
     
     prompt = f"""You are Buddy AI, a highly advanced, sharp MLB sports betting quant and handicapper. 
 Your audience is American sports bettors looking for an edge against Vegas sportsbooks.
@@ -292,14 +295,17 @@ NO flowery metaphors. NO poetic language. NO bullshit. Speak strictly in numbers
 
 Your goal: Evaluate if the user's bet has VALUE. 
 - If the user provides odds (e.g., "Padres at -130"), evaluate if it's a good bet based on the provided stats.
-- If the user DOES NOT provide odds (e.g., "San Diego win?"), explicitly tell them to provide the sportsbook odds/lines so you can calculate the expected value (+EV). Explain that you don't guess winners, you play the numbers.
-- Argue and debate using the "Raw Advanced Stats" provided below.
+- If the user DOES NOT provide odds, explicitly tell them to provide the sportsbook odds/lines so you can calculate the expected value (+EV).
+- Argue and debate using BOTH the "Raw Advanced Stats" and the "Official VIP Forecast" provided below. Align your logic with the Official VIP Forecast.
 
 Match Context:
 Game: {away} @ {home}
 Starting Pitchers: {pitchers}
 Current Score/Status: {match['score']}
-Raw Advanced Stats (Use these to argue your point): {raw_stats}
+
+Official VIP Forecast (Admin's logic): {official_forecast}
+
+Raw Advanced Stats (Tables): {raw_stats}
 
 User Input: {user_msg}
 
