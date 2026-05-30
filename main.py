@@ -11,8 +11,8 @@ from supabase import create_client, Client
 
 # === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧИ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SUPABASE_URL = "https://fnuzgypznyzcphewmjdl.supabase.co"
-SUPABASE_ANON_KEY = "sb_publishable_QihCry4fW9xq7S9cGJWCDg_TmUk46wP"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
