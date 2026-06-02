@@ -12,7 +12,8 @@ from supabase import create_client, Client
 # === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧИ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+# МЕНЯЕМ АНОНИМНЫЙ КЛЮЧ НА СЕРВИСНЫЙ:
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -21,8 +22,9 @@ else:
     print("CRITICAL WARNING: GEMINI_API_KEY variable is missing!")
     model = None
 
-if SUPABASE_URL and SUPABASE_ANON_KEY:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+    # ПОДКЛЮЧАЕМСЯ С ПРАВАМИ БОССА:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 else:
     print("CRITICAL WARNING: Supabase environment variables are missing!")
     supabase = None
