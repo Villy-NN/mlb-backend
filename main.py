@@ -264,18 +264,25 @@ def admin_update(match_id: str, data: AdminUpdate):
     save_match_to_supabase(match_id, matches_db[match_id])
     return {"status": "success", "message": "Saved to Supabase Permanent Storage."}
 
+# ЭНДПОИНТ ЧАТА: Теперь с защитой от спама и независимой памятью
 @app.post("/matches/{match_id}/chat")
-def chat_with_buddy(match_id: str, data: ChatMessage):
-    load_matches_from_supabase()
-    if match_id not in matches_db:
+@limiter.limit("30/day") # Лимит: 30 запросов в день!
+def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
+    # 1. Забываем про кэш! Тянем самый свежий матч ПРЯМО ИЗ БАЗЫ
+    if not supabase: raise HTTPException(status_code=500, detail="Database offline")
+    
+    res = supabase.table("matches").select("data").eq("id", match_id).execute()
+    if not res.data:
         raise HTTPException(status_code=404, detail="Match not found")
         
-    match = matches_db[match_id]
+    match = res.data[0]["data"]
     user_msg = data.message
-    user_id = data.user_id # Привязываем к email юзера
+    user_id = data.user_id 
     
+    # 2. Генерируем ответ Buddy
     ai_reply = generate_buddy_reply(match, user_msg)
     
+    # 3. Обновляем историю в вытащенном объекте
     if "chat_history" not in match or isinstance(match["chat_history"], list):
         match["chat_history"] = {}
         
@@ -285,7 +292,12 @@ def chat_with_buddy(match_id: str, data: ChatMessage):
     match["chat_history"][user_id].append({"role": "user", "text": user_msg})
     match["chat_history"][user_id].append({"role": "assistant", "text": ai_reply})
     
-    save_match_to_supabase(match_id, match)
+    # 4. Сохраняем обновленный объект ОБРАТНО В БАЗУ
+    supabase.table("matches").upsert({"id": match_id, "data": match}).execute()
+    
+    # Синхронизируем локальный кэш для вида /matches
+    matches_db[match_id] = match 
+    
     return {"reply": ai_reply}
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
