@@ -2,12 +2,15 @@ import os
 import requests
 from datetime import datetime, timedelta
 import time
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict
 import google.generativeai as genai
 from supabase import create_client, Client
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # === БЕЗОПАСНОСТЬ: ДОСТАЕМ КЛЮЧИ ИЗ ОКРУЖЕНИЯ RENDER.COM ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -31,6 +34,11 @@ else:
 # =========================================================
 
 app = FastAPI(title="MLB Buddy AI Server")
+
+# Настраиваем лимитер по IP-адресу
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
