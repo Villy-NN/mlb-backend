@@ -1,5 +1,6 @@
 import os
 import requests
+import httpx
 from datetime import datetime, timedelta
 import time
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +18,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 # МЕНЯЕМ АНОНИМНЫЙ КЛЮЧ НА СЕРВИСНЫЙ:
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+PLISIO_API_KEY = os.getenv("PLISIO_API_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -299,6 +301,59 @@ def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
     matches_db[match_id] = match 
     
     return {"reply": ai_reply}
+
+# 1. Эндпоинт для создания ссылки на оплату
+@app.post("/create-payment")
+async def create_payment(request: Request):
+    body = await request.json()
+    user_email = body.get("email")
+    
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    if not PLISIO_API_KEY:
+        raise HTTPException(status_code=500, detail="Payment gateway not configured")
+
+    params = {
+        "api_key": PLISIO_API_KEY,
+        "source_currency": "USD",
+        "source_amount": "29.99",
+        "order_number": f"vip_{user_email}",
+        "order_name": "BasePicks AI VIP Membership",
+        "callback_url": "https://mlb-ai-server.onrender.com/plisio-webhook",
+        "success_url": "https://www.basepicksai.com/?payment=success"
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get("https://plisio.net/api/v1/invoices/new", params=params)
+        data = response.json()
+
+    if data.get("status") == "success":
+        return {"payment_url": data["data"]["invoice_url"]}
+    else:
+        print("Ошибка кассы Plisio:", data)
+        raise HTTPException(status_code=500, detail="Payment gateway error")
+
+# 2. Эндпоинт-вебхук (Plisio пришлет сигнал, когда деньги поступят)
+@app.post("/plisio-webhook")
+async def plisio_webhook(request: Request):
+    form_data = await request.form()
+    
+    if form_data.get("status") == "completed":
+        order_number = form_data.get("order_number")
+        user_email = order_number.replace("vip_", "") if order_number else ""
+        
+        if not supabase:
+            print("Ошибка выдачи VIP в базе: Supabase offline")
+            return {"status": "ok"}
+
+        try:
+            supabase.table("users").update({"is_vip": True}).eq("email", user_email).execute()
+            print(f"VIP успешно выдан: {user_email}")
+        except Exception as e:
+            print(f"Ошибка выдачи VIP в базе: {e}")
+            
+    return {"status": "ok"}
 
 def generate_buddy_reply(match: dict, user_msg: str) -> str:
     if not model: return "System error. Gemini API Key is missing."
