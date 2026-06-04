@@ -316,6 +316,7 @@ async def create_payment(request: Request):
 
     params = {
         "api_key": PLISIO_API_KEY,
+        "currency": "USDT_TON",
         "source_currency": "USD",
         "source_amount": "29.99",
         "order_number": f"vip_{user_email}",
