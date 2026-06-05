@@ -19,6 +19,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 # МЕНЯЕМ АНОНИМНЫЙ КЛЮЧ НА СЕРВИСНЫЙ:
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 PLISIO_API_KEY = os.getenv("PLISIO_API_KEY")
+WEBHOOK_SECRET = "basepicks_vegas_2026_boss"
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -321,7 +322,7 @@ async def create_payment(request: Request):
         "source_amount": "29.99",
         "order_number": f"vip_{user_email}",
         "order_name": "BasePicks AI VIP Membership",
-        "callback_url": "https://mlb-ai-server.onrender.com/plisio-webhook",
+        "callback_url": f"https://mlb-ai-server.onrender.com/plisio-webhook?secret={WEBHOOK_SECRET}",
         "success_url": "https://www.basepicksai.com/?payment=success"
     }
 
@@ -335,24 +336,24 @@ async def create_payment(request: Request):
         print("Ошибка кассы Plisio:", data)
         raise HTTPException(status_code=500, detail="Payment gateway error")
 
-# 2. Эндпоинт-вебхук (Plisio пришлет сигнал, когда деньги поступят)
+# 2. Эндпоинт-вебхук с фейс-контролем
 @app.post("/plisio-webhook")
-async def plisio_webhook(request: Request):
+async def plisio_webhook(request: Request, secret: str = None):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Fake webhook detected!")
+
     form_data = await request.form()
     
     if form_data.get("status") == "completed":
         order_number = form_data.get("order_number")
         user_email = order_number.replace("vip_", "") if order_number else ""
         
-        if not supabase:
-            print("Ошибка выдачи VIP в базе: Supabase offline")
-            return {"status": "ok"}
-
-        try:
-            supabase.table("users").update({"is_vip": True}).eq("email", user_email).execute()
-            print(f"VIP успешно выдан: {user_email}")
-        except Exception as e:
-            print(f"Ошибка выдачи VIP в базе: {e}")
+        if supabase:
+            try:
+                supabase.table("users").update({"is_vip": True}).eq("email", user_email).execute()
+                print(f"VIP успешно выдан: {user_email}")
+            except Exception as e:
+                print(f"Ошибка: {e}")
             
     return {"status": "ok"}
 
