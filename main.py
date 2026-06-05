@@ -362,7 +362,7 @@ async def create_payment(request: Request):
         print("Ошибка кассы Plisio:", data)
         raise HTTPException(status_code=500, detail="Payment gateway error")
 
-# 2. Эндпоинт-вебхук: Начисление дней по календарю
+# 2. Эндпоинт-вебхук: Начисление дней + Реферальная программа
 @app.post("/plisio-webhook")
 async def plisio_webhook(request: Request, secret: str = None):
     if secret != WEBHOOK_SECRET:
@@ -382,6 +382,8 @@ async def plisio_webhook(request: Request, secret: str = None):
                 if not supabase: return {"status": "ok"}
                 
                 now = datetime.utcnow()
+                
+                # 1. НАЧИСЛЯЕМ VIP ПОКУПАТЕЛЮ
                 if plan_type == "season":
                     expire_date = datetime(2026, 11, 1, 0, 0, 0)
                 else:
@@ -394,9 +396,39 @@ async def plisio_webhook(request: Request, secret: str = None):
                         "is_vip": True,
                         "vip_until": expire_iso
                     }).eq("email", user_email).execute()
-                    print(f"Календарный VIP успешно выдан для {user_email} до {expire_iso}")
+                    print(f"VIP выдан покупателю: {user_email}")
                 except Exception as e:
-                    print(f"Ошибка обновления календаря в базе: {e}")
+                    print(f"Ошибка выдачи VIP: {e}")
+                    
+                # 2. ПРОВЕРЯЕМ РЕФЕРАЛКУ (Кому еще начислить бонус?)
+                try:
+                    buyer_res = supabase.table("users").select("referred_by").eq("email", user_email).execute()
+                    if buyer_res.data and buyer_res.data[0].get("referred_by"):
+                        sponsor_code = buyer_res.data[0]["referred_by"]
+                        
+                        sponsor_res = supabase.table("users").select("email, vip_until").eq("ref_code", sponsor_code).execute()
+                        if sponsor_res.data:
+                            sponsor_email = sponsor_res.data[0]["email"]
+                            sponsor_expire_str = sponsor_res.data[0].get("vip_until")
+                            
+                            if sponsor_expire_str:
+                                clean_iso = sponsor_expire_str.replace("Z", "+00:00")
+                                current_expire = datetime.fromisoformat(clean_iso).replace(tzinfo=None)
+                                if current_expire < now: current_expire = now
+                            else:
+                                current_expire = now
+                                
+                            new_sponsor_expire = current_expire + timedelta(days=30)
+                            new_sponsor_iso = new_sponsor_expire.isoformat() + "Z"
+                            
+                            supabase.table("users").update({
+                                "is_vip": True,
+                                "vip_until": new_sponsor_iso
+                            }).eq("email", sponsor_email).execute()
+                            print(f"Бонус +30 дней выдан спонсору: {sponsor_email}")
+                            
+                except Exception as e:
+                    print(f"Ошибка обработки рефералки: {e}")
             
     return {"status": "ok"}
 
