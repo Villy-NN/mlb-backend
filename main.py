@@ -320,25 +320,34 @@ def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
         "free_messages_left": 3 - (free_used + 1) if not is_vip else 999
     }
 
-# 1. Эндпоинт для создания ссылки на оплату
+# 1. Эндпоинт для создания ссылки на оплату (Monthly или Season)
 @app.post("/create-payment")
 async def create_payment(request: Request):
     body = await request.json()
     user_email = body.get("email")
+    plan = body.get("plan", "monthly")
     
     if not user_email:
         raise HTTPException(status_code=400, detail="Email is required")
-
     if not PLISIO_API_KEY:
         raise HTTPException(status_code=500, detail="Payment gateway not configured")
+
+    if plan == "season":
+        amount = "149.00"
+        order_name = "BasePicks AI Full Season Pass 2026"
+        order_number = f"vip_season_{user_email}"
+    else:
+        amount = "29.99"
+        order_name = "BasePicks AI Monthly VIP Membership"
+        order_number = f"vip_monthly_{user_email}"
 
     params = {
         "api_key": PLISIO_API_KEY,
         "currency": "USDT_TON",
         "source_currency": "USD",
-        "source_amount": "29.99",
-        "order_number": f"vip_{user_email}",
-        "order_name": "BasePicks AI VIP Membership",
+        "source_amount": amount,
+        "order_number": order_number,
+        "order_name": order_name,
         "callback_url": f"https://mlb-ai-server.onrender.com/plisio-webhook?secret={WEBHOOK_SECRET}",
         "success_url": "https://www.basepicksai.com/?payment=success"
     }
@@ -353,7 +362,7 @@ async def create_payment(request: Request):
         print("Ошибка кассы Plisio:", data)
         raise HTTPException(status_code=500, detail="Payment gateway error")
 
-# 2. Эндпоинт-вебхук с фейс-контролем
+# 2. Эндпоинт-вебхук: Начисление дней по календарю
 @app.post("/plisio-webhook")
 async def plisio_webhook(request: Request, secret: str = None):
     if secret != WEBHOOK_SECRET:
@@ -363,14 +372,31 @@ async def plisio_webhook(request: Request, secret: str = None):
     
     if form_data.get("status") == "completed":
         order_number = form_data.get("order_number")
-        user_email = order_number.replace("vip_", "") if order_number else ""
         
-        if supabase:
-            try:
-                supabase.table("users").update({"is_vip": True}).eq("email", user_email).execute()
-                print(f"VIP успешно выдан: {user_email}")
-            except Exception as e:
-                print(f"Ошибка: {e}")
+        if order_number and order_number.startswith("vip_"):
+            parts = order_number.split("_", 2)
+            if len(parts) >= 3:
+                plan_type = parts[1]
+                user_email = parts[2]
+                
+                if not supabase: return {"status": "ok"}
+                
+                now = datetime.utcnow()
+                if plan_type == "season":
+                    expire_date = datetime(2026, 11, 1, 0, 0, 0)
+                else:
+                    expire_date = now + timedelta(days=30)
+                
+                expire_iso = expire_date.isoformat() + "Z"
+                
+                try:
+                    supabase.table("users").update({
+                        "is_vip": True,
+                        "vip_until": expire_iso
+                    }).eq("email", user_email).execute()
+                    print(f"Календарный VIP успешно выдан для {user_email} до {expire_iso}")
+                except Exception as e:
+                    print(f"Ошибка обновления календаря в базе: {e}")
             
     return {"status": "ok"}
 
