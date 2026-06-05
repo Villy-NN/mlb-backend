@@ -269,6 +269,7 @@ def admin_update(match_id: str, data: AdminUpdate):
 
 # ЭНДПОИНТ ЧАТА: Лимиты + Проверка VIP + Счетчик бесплатных сообщений
 @app.post("/matches/{match_id}/chat")
+@limiter.limit("200/day")
 def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
     if not supabase: raise HTTPException(status_code=500, detail="Database offline")
     
@@ -298,7 +299,8 @@ def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
     match = res.data[0]["data"]
     
     # --- 3. ГЕНЕРИРУЕМ ОТВЕТ BUDDY ---
-    ai_reply = generate_buddy_reply(match, user_msg)
+    username = user_id.split('@')[0] if user_id else "Bettor"
+    ai_reply = generate_buddy_reply(match, user_msg, username)
     
     # --- 4. СОХРАНЯЕМ ИСТОРИЮ ---
     if "chat_history" not in match or isinstance(match["chat_history"], list):
@@ -372,18 +374,18 @@ async def plisio_webhook(request: Request, secret: str = None):
             
     return {"status": "ok"}
 
-def generate_buddy_reply(match: dict, user_msg: str) -> str:
+def generate_buddy_reply(match: dict, user_msg: str, username: str = "Bettor") -> str:
     if not model: return "System error. Gemini API Key is missing."
     away = match['away_team']
     home = match['home_team']
     pitchers = match['manual_pitchers'] if match['manual_pitchers'] else match['pitchers']
     
-    # Теперь он видит И сырые таблицы из Экселя, И твой официальный прогноз
     raw_stats = match.get('preview_text', 'No raw stats provided.')
     official_forecast = match.get('ai_analysis', 'No official forecast published yet.')
     
     prompt = f"""You are Buddy AI, a highly advanced, sharp MLB sports betting quant and handicapper. 
 Your audience is American sports bettors looking for an edge against Vegas sportsbooks.
+The user you are talking to is a VIP client named '{username}'. Occasionally address them by name to build rapport, but keep it sharp and professional. Do not overdo it.
 
 TONE & STYLE: 
 You must completely ADOPT and MIRROR the literary style, sarcasm, and tone of the "Official VIP Forecast" written by the Admin. If the Admin uses vivid metaphors, dark humor, or poetic cynicism (e.g., comparing a team to "decayed aristocrats"), YOU MUST adopt that exact same vibe in your responses. Be analytical and speak in numbers (+EV, probabilities), but wrap your analysis in the Admin's unique, sharp, and slightly arrogant literary style.
