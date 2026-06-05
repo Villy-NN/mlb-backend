@@ -368,11 +368,15 @@ async def plisio_webhook(request: Request, secret: str = None):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Fake webhook detected!")
 
-    form_data = await request.form()
+    # --- АНТИКРЭШ: Читаем данные встроенными средствами Python ---
+    from urllib.parse import parse_qs
+    body_bytes = await request.body()
+    parsed_data = parse_qs(body_bytes.decode('utf-8'))
     
-    if form_data.get("status") == "completed":
-        order_number = form_data.get("order_number")
-        
+    status = parsed_data.get("status", [None])[0]
+    order_number = parsed_data.get("order_number", [None])[0]
+    
+    if status == "completed":
         if order_number and order_number.startswith("vip_"):
             parts = order_number.split("_", 2)
             if len(parts) >= 3:
