@@ -267,25 +267,40 @@ def admin_update(match_id: str, data: AdminUpdate):
     save_match_to_supabase(match_id, matches_db[match_id])
     return {"status": "success", "message": "Saved to Supabase Permanent Storage."}
 
-# ЭНДПОИНТ ЧАТА: Теперь с защитой от спама и независимой памятью
+# ЭНДПОИНТ ЧАТА: Лимиты + Проверка VIP + Счетчик бесплатных сообщений
 @app.post("/matches/{match_id}/chat")
-@limiter.limit("30/day") # Лимит: 30 запросов в день!
 def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
-    # 1. Забываем про кэш! Тянем самый свежий матч ПРЯМО ИЗ БАЗЫ
     if not supabase: raise HTTPException(status_code=500, detail="Database offline")
     
+    user_msg = data.message
+    user_id = data.user_id 
+    
+    # --- 1. ПРОВЕРКА ПРАВ ДОСТУПА И СЧЕТЧИКОВ ---
+    user_res = supabase.table("users").select("is_vip, free_messages_used").eq("email", user_id).execute()
+    if not user_res.data:
+        raise HTTPException(status_code=403, detail="User not found in database.")
+        
+    user_data = user_res.data[0]
+    is_vip = user_data.get("is_vip", False)
+    free_used = user_data.get("free_messages_used", 0)
+    
+    if not is_vip:
+        if free_used >= 3:
+            raise HTTPException(status_code=403, detail="Free limit reached. Upgrade to VIP.")
+        else:
+            supabase.table("users").update({"free_messages_used": free_used + 1}).eq("email", user_id).execute()
+    
+    # --- 2. ПОЛУЧАЕМ МАТЧ ---
     res = supabase.table("matches").select("data").eq("id", match_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Match not found")
         
     match = res.data[0]["data"]
-    user_msg = data.message
-    user_id = data.user_id 
     
-    # 2. Генерируем ответ Buddy
+    # --- 3. ГЕНЕРИРУЕМ ОТВЕТ BUDDY ---
     ai_reply = generate_buddy_reply(match, user_msg)
     
-    # 3. Обновляем историю в вытащенном объекте
+    # --- 4. СОХРАНЯЕМ ИСТОРИЮ ---
     if "chat_history" not in match or isinstance(match["chat_history"], list):
         match["chat_history"] = {}
         
@@ -295,13 +310,13 @@ def chat_with_buddy(request: Request, match_id: str, data: ChatMessage):
     match["chat_history"][user_id].append({"role": "user", "text": user_msg})
     match["chat_history"][user_id].append({"role": "assistant", "text": ai_reply})
     
-    # 4. Сохраняем обновленный объект ОБРАТНО В БАЗУ
     supabase.table("matches").upsert({"id": match_id, "data": match}).execute()
-    
-    # Синхронизируем локальный кэш для вида /matches
     matches_db[match_id] = match 
     
-    return {"reply": ai_reply}
+    return {
+        "reply": ai_reply, 
+        "free_messages_left": 3 - (free_used + 1) if not is_vip else 999
+    }
 
 # 1. Эндпоинт для создания ссылки на оплату
 @app.post("/create-payment")
