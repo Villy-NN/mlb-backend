@@ -60,6 +60,7 @@ class ChatMessage(BaseModel):
     user_id: str 
 
 class AdminUpdate(BaseModel):
+    secret_key: str
     ai_analysis: Optional[str] = None
     preview_text: Optional[str] = None
     manual_pitchers: Optional[str] = None
@@ -255,11 +256,13 @@ def publish_board():
 
 @app.post("/matches/{match_id}/admin-update")
 def admin_update(match_id: str, data: AdminUpdate):
+    if data.secret_key != "admin123":
+        raise HTTPException(status_code=403, detail="Access Denied. Nice try.")
+        
     load_matches_from_supabase()
     if match_id not in matches_db:
         raise HTTPException(status_code=404, detail="Match not found")
         
-    # strip() убирает случайные пробелы в начале и конце, но сохраняет внутренние переносы строк
     if data.ai_analysis is not None: matches_db[match_id]["ai_analysis"] = data.ai_analysis.strip()
     if data.preview_text is not None: matches_db[match_id]["preview_text"] = data.preview_text.strip()
     if data.manual_pitchers is not None: matches_db[match_id]["manual_pitchers"] = data.manual_pitchers.strip()
